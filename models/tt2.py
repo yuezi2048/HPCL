@@ -1,0 +1,667 @@
+# coding: utf-8
+import os
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn.conv import MessagePassing
+from torch_geometric.utils import remove_self_loops, degree
+
+from common.abstract_recommender import GeneralRecommender
+from utils.mi_estimator import CLUBSample
+
+class TT2(GeneralRecommender):
+    def __init__(self, config, dataset):
+        super(TT2, self).__init__(config, dataset)
+
+        num_user = self.n_users
+        num_item = self.n_items
+        batch_size = config['train_batch_size']  # not used
+        dim_x = config['embedding_size']
+        self.feat_embed_dim = config['feat_embed_dim']
+        self.n_layers = config['n_mm_layers']
+        self.knn_k = config['knn_k']
+        self.mm_image_weight = config['mm_image_weight']
+
+        self.batch_size = batch_size
+        self.num_user = num_user
+        self.num_item = num_item
+        self.k = 40
+        self.aggr_mode = 'add'
+        self.dataset = dataset
+        self.dropout = config['dropout']
+        # self.construction = 'weighted_max'
+        self.reg_weight = config['reg_weight']
+        self.align_weight = config['align_weight']
+        self.mask_weight_g = config['mask_weight_g']
+        self.mask_weight_f = config['mask_weight_f']
+        self.infoNCETemp = config['infoNCETemp']
+        self.lambda_graded_align = config['lambda_graded_align']  # 兼容旧配置
+
+        self.drop_rate = 0.1
+        self.v_rep = None
+        self.t_rep = None
+        self.v_preference = None
+        self.t_preference = None
+        self.id_preference = None
+        self.dim_latent = 64
+        self.dim_feat = 128
+        self.mm_adj = None
+
+        self.mlp = nn.Linear(2*dim_x, 2*dim_x)
+
+        dataset_path = os.path.abspath(config['data_path'] + config['dataset'])
+        self.user_graph_dict = np.load(os.path.join(dataset_path, config['user_graph_dict_file']),
+                                       allow_pickle=True).item()
+
+        mm_adj_file = os.path.join(dataset_path, 'mm_adj_{}.pt'.format(self.knn_k))
+
+        if self.v_feat is not None:
+            self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
+            self.image_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
+        if self.t_feat is not None:
+            self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
+            self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
+
+        if os.path.exists(mm_adj_file):
+            self.mm_adj = torch.load(mm_adj_file)
+        else:
+            if self.v_feat is not None:
+                indices, image_adj = self.get_knn_adj_mat(self.image_embedding.weight.detach())
+                self.mm_adj = image_adj
+            if self.t_feat is not None:
+                indices, text_adj = self.get_knn_adj_mat(self.text_embedding.weight.detach())
+                self.mm_adj = text_adj
+            if self.v_feat is not None and self.t_feat is not None:
+                self.mm_adj = self.mm_image_weight * image_adj + (1.0 - self.mm_image_weight) * text_adj
+                del text_adj
+                del image_adj
+            torch.save(self.mm_adj, mm_adj_file)
+
+        # packing interaction in training into edge_index
+        train_interactions = dataset.inter_matrix(form='coo').astype(np.float32)
+        edge_index = self.pack_edge_index(train_interactions)
+        self.edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous().to(self.device)
+        self.edge_index = torch.cat((self.edge_index, self.edge_index[[1, 0]]), dim=1)
+
+        # pdb.set_trace()
+        self.weight_u = nn.Parameter(nn.init.xavier_normal_(
+            torch.tensor(np.random.randn(self.num_user, 2, 1), dtype=torch.float32, requires_grad=True)))
+        self.weight_u.data = F.softmax(self.weight_u, dim=1)
+
+        self.weight_i = nn.Parameter(nn.init.xavier_normal_(
+            torch.tensor(np.random.randn(self.num_item, 2, 1), dtype=torch.float32, requires_grad=True)))
+        self.weight_i.data = F.softmax(self.weight_i, dim=1)
+
+        self.item_index = torch.zeros([self.num_item], dtype=torch.long)
+        index = []
+        for i in range(self.num_item):
+            self.item_index[i] = i
+            index.append(i)
+        self.drop_percent = self.drop_rate
+        self.single_percent = 1
+        self.double_percent = 0
+
+        drop_item = torch.tensor(
+            np.random.choice(self.item_index, int(self.num_item * self.drop_percent), replace=False))
+        drop_item_single = drop_item[:int(self.single_percent * len(drop_item))]
+
+        self.dropv_node_idx_single = drop_item_single[:int(len(drop_item_single) * 1 / 3)]
+        self.dropt_node_idx_single = drop_item_single[int(len(drop_item_single) * 2 / 3):]
+
+        self.dropv_node_idx = self.dropv_node_idx_single
+        self.dropt_node_idx = self.dropt_node_idx_single
+
+        mask_cnt = torch.zeros(self.num_item, dtype=int).tolist()
+        for edge in edge_index:
+            mask_cnt[edge[1] - self.num_user] += 1
+        mask_dropv = []
+        mask_dropt = []
+        for idx, num in enumerate(mask_cnt):
+            temp_false = [False] * num
+            temp_true = [True] * num
+            mask_dropv.extend(temp_false) if idx in self.dropv_node_idx else mask_dropv.extend(temp_true)
+            mask_dropt.extend(temp_false) if idx in self.dropt_node_idx else mask_dropt.extend(temp_true)
+
+        edge_index = edge_index[np.lexsort(edge_index.T[1, None])]
+        edge_index_dropv = edge_index[mask_dropv]
+        edge_index_dropt = edge_index[mask_dropt]
+
+        self.edge_index_dropv = torch.tensor(edge_index_dropv).t().contiguous().to(self.device)
+        self.edge_index_dropt = torch.tensor(edge_index_dropt).t().contiguous().to(self.device)
+
+        self.edge_index_dropv = torch.cat((self.edge_index_dropv, self.edge_index_dropv[[1, 0]]), dim=1)
+        self.edge_index_dropt = torch.cat((self.edge_index_dropt, self.edge_index_dropt[[1, 0]]), dim=1)
+
+        self.MLP_user = nn.Linear(self.dim_latent * 2, self.dim_latent)
+
+        if self.v_feat is not None:
+            self.v_gcn = GCN(self.dataset, batch_size, num_user, num_item, dim_x, self.aggr_mode, dim_latent=64,
+                             device=self.device, features=self.v_feat)
+        if self.t_feat is not None:
+            self.t_gcn = GCN(self.dataset, batch_size, num_user, num_item, dim_x, self.aggr_mode, dim_latent=64,
+                             device=self.device, features=self.t_feat)
+
+        self.id_feat = nn.Parameter(
+            nn.init.xavier_normal_(torch.tensor(np.random.randn(self.n_items, self.dim_latent), dtype=torch.float32,
+                                                requires_grad=True), gain=1).to(self.device))
+        self.id_gcn = GCN(self.dataset, batch_size, num_user, num_item, dim_x, self.aggr_mode,
+                          dim_latent=64, device=self.device, features=self.id_feat)
+
+        self.result_embed_n1 = nn.Parameter(
+            nn.init.xavier_normal_(torch.tensor(np.random.randn(num_user + num_item, dim_x)))).to(self.device)
+        self.result_embed_n2 = nn.Parameter(
+            nn.init.xavier_normal_(torch.tensor(np.random.randn(num_user + num_item, dim_x)))).to(self.device)
+
+        # =================================================================
+        # DGMRec 解耦模块 (简化版) START
+        # =================================================================
+
+        # DGMRec 使用其 'embedding_size' 作为核心维度，我们将其映射到 MENTOR 的 dim_x
+        self.embedding_dim = dim_x
+
+        # 1. DGMRec 编码器 (用于分解 G 和 S)
+        # (使用 MENTOR 的 self.v_feat 和 self.t_feat 作为输入维度)
+        self.image_encoder = nn.Linear(self.v_feat.shape[1], self.embedding_dim).to(self.device)
+        self.text_encoder = nn.Linear(self.t_feat.shape[1], self.embedding_dim).to(self.device)
+        self.shared_encoder = nn.Linear(self.embedding_dim, self.embedding_dim).to(self.device)
+        nn.init.xavier_uniform_(self.image_encoder.weight)
+        nn.init.xavier_uniform_(self.text_encoder.weight)
+        nn.init.xavier_uniform_(self.shared_encoder.weight)
+
+        # 特定(Specific)特征编码器
+        self.image_encoder_s = nn.Linear(self.v_feat.shape[1], self.embedding_dim).to(self.device)
+        self.text_encoder_s = nn.Linear(self.t_feat.shape[1], self.embedding_dim).to(self.device)
+        nn.init.xavier_uniform_(self.image_encoder_s.weight)
+        nn.init.xavier_uniform_(self.text_encoder_s.weight)
+
+        # 2. DGMRec 超参数
+        self.lambda_1 = config['lambda_1']
+
+        self.act_g = nn.Tanh()
+
+        # 3. DGMRec MI 估计器 (CLUB)
+        self.init_mi_estimator()  # 调用辅助函数
+
+        # =================================================================
+        # DGMRec 解耦模块 (简化版) END
+        # =================================================================
+
+    def get_knn_adj_mat(self, mm_embeddings):
+        context_norm = mm_embeddings.div(torch.norm(mm_embeddings, p=2, dim=-1, keepdim=True))
+        sim = torch.mm(context_norm, context_norm.transpose(1, 0))
+        _, knn_ind = torch.topk(sim, self.knn_k, dim=-1)
+        adj_size = sim.size()
+        del sim
+        # construct sparse adj
+        indices0 = torch.arange(knn_ind.shape[0]).to(self.device)
+        indices0 = torch.unsqueeze(indices0, 1)
+        indices0 = indices0.expand(-1, self.knn_k)
+        indices = torch.stack((torch.flatten(indices0), torch.flatten(knn_ind)), 0)
+        # norm
+        return indices, self.compute_normalized_laplacian(indices, adj_size)
+
+    def compute_normalized_laplacian(self, indices, adj_size):
+        adj = torch.sparse.FloatTensor(indices, torch.ones_like(indices[0]), adj_size)
+        row_sum = 1e-7 + torch.sparse.sum(adj, -1).to_dense()
+        r_inv_sqrt = torch.pow(row_sum, -0.5)
+        rows_inv_sqrt = r_inv_sqrt[indices[0]]
+        cols_inv_sqrt = r_inv_sqrt[indices[1]]
+        values = rows_inv_sqrt * cols_inv_sqrt
+        return torch.sparse.FloatTensor(indices, values, adj_size)
+
+    def pre_epoch_processing(self):
+        self.epoch_user_graph, self.user_weight_matrix = self.topk_sample(self.k)
+        self.user_weight_matrix = self.user_weight_matrix.to(self.device)
+
+        # =================================================================
+        # DGMRec MI 估计器训练 START
+        # =================================================================
+        # (我们必须先生成 G/S 嵌入来训练估计器)
+        item_image_g, item_text_g, item_image_s, item_text_s = self.mge()  #
+
+        # DGM 默认训练 5 次
+        for _ in range(5):
+            self.item_image_estimator.train();
+            self.item_text_estimator.train()  #
+
+            # (DGM 使用 2048，如果项目数较少，请调整此值)
+            item_rand_idx = torch.randperm(self.n_items)[:2048].to(self.device)
+
+            loss_mi = 0.0
+            # 计算 CLUB 学习损失
+            loss_mi += self.item_image_estimator.learning_loss(item_image_s[item_rand_idx], item_image_g[item_rand_idx])
+            loss_mi += self.item_text_estimator.learning_loss(item_text_s[item_rand_idx], item_text_g[item_rand_idx])
+
+            self.optimizer_club.zero_grad()
+            loss_mi.backward(retain_graph=True)  # 必须保留图，因为 mge() 的输出稍后会用于主损失
+            self.optimizer_club.step()
+
+        self.item_image_estimator.eval();
+        self.item_text_estimator.eval()  #
+
+
+    # =================================================================
+    # DGMRec MI 估计器训练 END
+    # =================================================================
+
+    def pack_edge_index(self, inter_mat):
+        rows = inter_mat.row
+        cols = inter_mat.col + self.n_users
+        # ndarray([598918, 2]) for ml-imdb
+        return np.column_stack((rows, cols))
+
+    def InfoNCE(self, view1, view2, temp):
+        view1, view2 = F.normalize(view1, dim=1), F.normalize(view2, dim=1)
+        pos_score = (view1 * view2).sum(dim=-1)
+        pos_score = torch.exp(pos_score / temp)
+        ttl_score = torch.matmul(view1, view2.transpose(0, 1))
+        ttl_score = torch.exp(ttl_score / temp).sum(dim=1)
+        cl_loss = -torch.log(pos_score / ttl_score)
+        return torch.mean(cl_loss)
+
+    # =================================================================
+    # DGMRec 辅助函数 (简化版) START
+    # =================================================================
+
+    def init_weight(self, layer):
+        # (来自 dgmrec.py)
+        if isinstance(layer, nn.Linear):
+            nn.init.xavier_uniform_(layer.weight)
+
+    def init_mi_estimator(self):
+        # (来自 dgmrec.py, 仅初始化物品端的估计器)
+        self.item_image_estimator = CLUBSample(self.embedding_dim, self.embedding_dim, 64).to(self.device)
+        self.item_text_estimator = CLUBSample(self.embedding_dim, self.embedding_dim, 64).to(self.device)
+
+        # 将 CLUB 模块的参数收集到一个列表中，以便创建专用的优化器
+        params = list(self.item_image_estimator.parameters()) + \
+                 list(self.item_text_estimator.parameters())
+
+        # 为 MI 估计器 (CLUB) 创建单独的优化器
+        self.optimizer_club = torch.optim.Adam(params, lr=1e-4)
+
+    def mge(self):
+        # 模态嵌入 (G 和 S) (来自 dgmrec.py)
+        # (使用 MENTOR 继承的 self.image_embedding 和 self.text_embedding)
+
+        # 通用(General)特征 G
+        item_image_g = F.sigmoid(self.shared_encoder(self.act_g(self.image_encoder(self.image_embedding.weight))))
+        item_text_g = F.sigmoid(self.shared_encoder(self.act_g(self.text_encoder(self.text_embedding.weight))))
+
+        # 特定(Specific)特征 S
+        item_image_s = F.sigmoid(self.image_encoder_s(self.image_embedding.weight))
+        item_text_s = F.sigmoid(self.text_encoder_s(self.text_embedding.weight))
+        return item_image_g, item_text_g, item_image_s, item_text_s
+
+        # =================================================================
+        # DGMRec 辅助函数 (简化版) END
+        # =================================================================
+
+    def _generate_representations(self, v_rep, t_rep):
+        # 封装的辅助方法，用于从 GCN 输出生成最终嵌入
+
+        # 1. 拼接模态
+        representation = torch.cat((v_rep, t_rep), dim=1)
+
+        # 2. 生成用户表征
+        # (注意：这里需要对传入的 v_rep, t_rep 进行 unsqueeze)
+        v_rep_u = torch.unsqueeze(v_rep[:self.num_user], 2)
+        t_rep_u = torch.unsqueeze(t_rep[:self.num_user], 2)
+        user_rep = torch.cat((v_rep_u, t_rep_u), dim=2)
+        user_rep = self.weight_u.transpose(1, 2) * user_rep
+        user_rep = torch.cat((user_rep[:, :, 0], user_rep[:, :, 1]), dim=1)
+
+        # 3. 生成并细化物品表征
+        item_rep = representation[self.num_user:]
+        h = self.buildItemGraph(item_rep)
+        item_rep = item_rep + h
+
+        # 4. 组合成最终嵌入
+        result_embed = torch.cat((user_rep, item_rep), dim=0)
+
+        # 5. 返回所有需要的结果 (result_embed 用于 BPR, user/item_rep 用于 mask_f_loss)
+        return result_embed, user_rep, item_rep
+
+    def forward(self, interaction):
+        user_nodes, pos_item_nodes, neg_item_nodes = interaction[0], interaction[1], interaction[2]
+
+        # 1. 生成所有 GCN 输出
+        # 主路径
+        self.v_rep, self.v_preference = self.v_gcn(self.edge_index_dropv, self.edge_index, self.v_feat)
+        self.t_rep, self.t_preference = self.t_gcn(self.edge_index_dropt, self.edge_index, self.t_feat)
+
+        # 噪声视图 1
+        v_rep_n1, _ = self.v_gcn(self.edge_index_dropv, self.edge_index, self.v_feat, perturbed=True)
+        t_rep_n1, _ = self.t_gcn(self.edge_index_dropt, self.edge_index, self.t_feat, perturbed=True)
+
+        # 噪声视图 2
+        v_rep_n2, _ = self.v_gcn(self.edge_index_dropv, self.edge_index, self.v_feat, perturbed=True)
+        t_rep_n2, _ = self.t_gcn(self.edge_index_dropt, self.edge_index, self.t_feat, perturbed=True)
+
+        # ID GCN (保持不变, 但它的输出在当前逻辑中未被主任务使用)
+        self.id_rep, self.id_preference = self.id_gcn(self.edge_index_dropt, self.edge_index, self.id_feat)
+
+        # 2. 三次调用辅助方法来生成最终嵌入
+        # 主嵌入 (需要保存 user_rep 和 item_rep 用于 mask_f_loss)
+        self.result_embed, self.user_rep, self.item_rep = self._generate_representations(self.v_rep, self.t_rep)
+
+        # 噪声嵌入 1
+        self.result_embed_n1, _, _ = self._generate_representations(v_rep_n1, t_rep_n1)
+
+        # 噪声嵌入 2
+        self.result_embed_n2, _, _ = self._generate_representations(v_rep_n2, t_rep_n2)
+
+        # 3. 计算分数用于 BPR 损失
+        pos_item_nodes += self.n_users
+        neg_item_nodes += self.n_users
+        user_tensor = self.result_embed[user_nodes]
+        pos_item_tensor = self.result_embed[pos_item_nodes]
+        neg_item_tensor = self.result_embed[neg_item_nodes]
+        pos_scores = torch.sum(user_tensor * pos_item_tensor, dim=1)
+        neg_scores = torch.sum(user_tensor * neg_item_tensor, dim=1)
+        return pos_scores, neg_scores
+
+    def buildItemGraph(self, h):
+        for i in range(self.n_layers):
+            h = torch.sparse.mm(self.mm_adj, h)
+        return h
+
+    def _find_graded_samples(self, batch_items, item_image_g, item_text_g, item_image_s, item_text_s, k=10):
+        """
+        为批次中的每个物品动态识别分级样本。
+        - 强正样本 (R): 通用特征在两个模态上都相似。
+        - 弱正样本 (T_v, T_t): 特定特征在一个模态上相似，在另一个模态上不相似。
+        """
+        # 1. 提取当前批次的物品特征并进行归一化
+        batch_size = len(batch_items)
+        device = batch_items.device
+
+        g_v = F.normalize(item_image_g[batch_items], dim=1)
+        g_t = F.normalize(item_text_g[batch_items], dim=1)
+        s_v = F.normalize(item_image_s[batch_items], dim=1)
+        s_t = F.normalize(item_text_s[batch_items], dim=1)
+
+        # 2. 计算所有相似度矩阵
+        sim_g_v = g_v @ g_v.T
+        sim_g_t = g_t @ g_t.T
+        sim_s_v = s_v @ s_v.T
+        sim_s_t = s_t @ s_t.T
+
+        # 创建一个对角线为-inf的掩码，防止物品将自己选为邻居
+        self_mask = torch.eye(batch_size, dtype=torch.bool, device=device)
+
+        # 3. 识别强正样本 (Multi-modal Similar, R)
+        score_multi = sim_g_v * sim_g_t
+        score_multi.masked_fill_(self_mask, -torch.inf)
+        _, R_indices = torch.topk(score_multi, k=min(k, batch_size - 1), dim=1)
+
+        # 4. 识别弱正样本 (Single-modal Similar, T_v, T_t)
+        # 创建一个掩码，排除已经被选为强正样本的物品
+        R_mask = torch.zeros_like(score_multi, dtype=torch.bool).scatter_(1, R_indices, True)
+        R_mask.logical_or_(self_mask)  # 同时也排除自己
+
+        # 视觉弱正样本 T_v
+        score_single_v = sim_s_v * (1 - sim_s_t)
+        score_single_v.masked_fill_(R_mask, -torch.inf)
+        _, T_v_indices = torch.topk(score_single_v, k=min(k, batch_size - 1 - k), dim=1)
+
+        # 文本弱正样本 T_t
+        score_single_t = sim_s_t * (1 - sim_s_v)
+        score_single_t.masked_fill_(R_mask, -torch.inf)
+        _, T_t_indices = torch.topk(score_single_t, k=min(k, batch_size - 1 - k), dim=1)
+
+        # 5. 返回结果
+        # 返回的是在当前 batch 内的相对索引
+        return {
+            'R': R_indices,
+            'T_v': T_v_indices,
+            'T_t': T_t_indices
+        }
+
+    def _calculate_s_contrastive_loss(self, graded_samples, item_image_s, item_text_s, batch_items, temp=0.2,
+                                      epsilon=1e-8):
+        """
+        根据分级样本计算特定特征(S)的对比损失。
+        """
+        # 提取当前批次的特定特征并归一化
+        s_v = F.normalize(item_image_s[batch_items], dim=1)
+        s_t = F.normalize(item_text_s[batch_items], dim=1)
+
+        # 计算视觉和文本的相似度矩阵
+        sim_s_v = (s_v @ s_v.T) / temp
+        sim_s_t = (s_t @ s_t.T) / temp
+
+        exp_sim_s_v = torch.exp(sim_s_v)
+        exp_sim_s_t = torch.exp(sim_s_t)
+
+        # 从分级样本中获取索引
+        R_indices = graded_samples['R']
+        T_v_indices = graded_samples['T_v']
+        T_t_indices = graded_samples['T_t']
+
+        # --- 计算视觉特定特征损失 ---
+        # 分子：强正样本 + 视觉弱正样本
+        pos_v_R = torch.gather(exp_sim_s_v, 1, R_indices).sum(dim=1)
+        pos_v_T = torch.gather(exp_sim_s_v, 1, T_v_indices).sum(dim=1)
+        numerator_v = pos_v_R + pos_v_T
+
+        # 分母：所有样本 (在我们的简化实现中，分母就是整行exp_sim的总和)
+        denominator_v = exp_sim_s_v.sum(dim=1)
+
+        loss_S_visual = -torch.log(numerator_v / (denominator_v + epsilon)).mean()
+
+        # --- 计算文本特定特征损失 ---
+        # 分子：强正样本 + 文本弱正样本
+        pos_t_R = torch.gather(exp_sim_s_t, 1, R_indices).sum(dim=1)
+        pos_t_T = torch.gather(exp_sim_s_t, 1, T_t_indices).sum(dim=1)
+        numerator_t = pos_t_R + pos_t_T
+
+        # 分母：所有样本
+        denominator_t = exp_sim_s_t.sum(dim=1)
+
+        loss_S_textual = -torch.log(numerator_t / (denominator_t + epsilon)).mean()
+
+        return loss_S_visual + loss_S_textual
+
+    def calculate_loss(self, interaction):
+        user = interaction[0]
+        pos_scores, neg_scores = self.forward(interaction)
+        loss_value = -torch.mean(torch.log2(torch.sigmoid(pos_scores - neg_scores)))
+
+        # reg
+        reg_embedding_loss_v = (self.v_preference[user] ** 2).mean() if self.v_preference is not None else 0.0
+        reg_embedding_loss_t = (self.t_preference[user] ** 2).mean() if self.t_preference is not None else 0.0
+        reg_loss = self.reg_weight * (reg_embedding_loss_v + reg_embedding_loss_t)
+        reg_loss += self.reg_weight * (self.weight_u ** 2).mean()
+
+        # mask
+        with torch.no_grad():
+            u_temp, i_temp = self.user_rep.clone(), self.item_rep.clone()
+            u_temp2, i_temp2 = self.user_rep.clone(), self.item_rep.clone()
+            u_temp.detach()
+            i_temp.detach()
+            u_temp2.detach()
+            i_temp2.detach()
+            u_temp2 = self.mlp(u_temp2)
+            i_temp2 = self.mlp(i_temp2)
+            u_temp = F.dropout(u_temp, self.dropout)
+            i_temp = F.dropout(i_temp, self.dropout)
+        mask_loss_u = 1 - F.cosine_similarity(u_temp, u_temp2).mean()
+        mask_loss_i = 1 - F.cosine_similarity(i_temp, i_temp2).mean()
+        mask_f_loss = self.mask_weight_f * (mask_loss_i + mask_loss_u)
+
+        # 图噪音cl
+        # inspired by SimGCL
+        mask_g_loss = (self.InfoNCE(self.result_embed_n1[:self.n_users], self.result_embed_n2[:self.n_users], self.infoNCETemp)
+                       + self.InfoNCE(self.result_embed_n1[self.n_users:], self.result_embed_n2[self.n_users:], self.infoNCETemp))
+
+        mask_g_loss = mask_g_loss * self.mask_weight_g
+
+        # =================================================================
+        # DGM 解耦逻辑
+        # =================================================================
+
+        # 1. (修复) 必须先从 interaction 中定义 all_batch_items
+        # !! 确保这一行存在并且没有被注释掉 !!
+        all_batch_items, _ = torch.unique(torch.cat((interaction[1], interaction[2])), return_inverse=True,
+                                          sorted=False)
+        valid_mask = (all_batch_items >= 0) & (all_batch_items < self.n_items)
+        all_batch_items = all_batch_items[valid_mask]
+
+        loss_disentangle = torch.tensor(0.0).to(self.device)
+
+        if all_batch_items.shape[0] > 1:  # 至少需要2个物品才能进行对比
+            item_image_g, item_text_g, item_image_s, item_text_s = self.mge()
+
+            # 1. 识别分级样本
+            graded_samples = self._find_graded_samples(all_batch_items, item_image_g, item_text_g, item_image_s,
+                                                       item_text_s, k=self.knn_k)
+
+            # 2. 计算 G 特征的对齐损失 (保持不变或使用更复杂的版本)
+            loss_InfoNCE_G = self.InfoNCE(item_image_g[all_batch_items], item_text_g[all_batch_items],
+                                          temp=self.infoNCETemp)
+
+            # 3. 计算 S 特征的分级对比损失
+            loss_S_contrastive = self._calculate_s_contrastive_loss(graded_samples, item_image_s, item_text_s,
+                                                                    all_batch_items, temp=self.infoNCETemp)
+
+            # 组合成新的 graded_alignment_loss
+            # 您可以在配置文件中为 loss_S_contrastive 设置一个权重
+            loss_graded = loss_InfoNCE_G + loss_S_contrastive
+
+            # 4. 计算 CLUB 损失 (保持不变)
+            loss_club = 0.0
+            loss_club += self.item_image_estimator(item_image_s[all_batch_items],
+                                                   item_image_g[all_batch_items].detach())
+            loss_club += self.item_text_estimator(item_text_s[all_batch_items], item_text_g[all_batch_items].detach())
+
+            # 5. 组合成最终的解缠损失
+            # 注意：这里的 self.lambda_1 (来自配置文件) 现在可以被理解为 loss_club 的权重
+            # 你需要为 loss_graded 增加一个新的超参数，例如 self.lambda_graded_align
+            loss_disentangle = self.lambda_1 * loss_club + self.lambda_graded_align * loss_graded  # 假设已添加 lambda_graded_align
+
+        # ... (加总所有损失) ...
+        total_loss = loss_value + reg_loss + mask_f_loss + mask_g_loss + loss_disentangle
+        return total_loss
+
+    def full_sort_predict(self, interaction):
+        user_tensor = self.result_embed[:self.n_users]
+        item_tensor = self.result_embed[self.n_users:]
+
+        temp_user_tensor = user_tensor[interaction[0], :]
+        score_matrix = torch.matmul(temp_user_tensor, item_tensor.t())
+        return score_matrix
+
+    def topk_sample(self, k):
+        user_graph_index = []
+        count_num = 0
+        user_weight_matrix = torch.zeros(len(self.user_graph_dict), k)
+        tasike = []
+        for i in range(k):
+            tasike.append(0)
+        for i in range(len(self.user_graph_dict)):
+            if len(self.user_graph_dict[i][0]) < k:
+                count_num += 1
+                if len(self.user_graph_dict[i][0]) == 0:
+                    # pdb.set_trace()
+                    user_graph_index.append(tasike)
+                    continue
+                user_graph_sample = self.user_graph_dict[i][0][:k]
+                user_graph_weight = self.user_graph_dict[i][1][:k]
+                while len(user_graph_sample) < k:
+                    rand_index = np.random.randint(0, len(user_graph_sample))
+                    user_graph_sample.append(user_graph_sample[rand_index])
+                    user_graph_weight.append(user_graph_weight[rand_index])
+                user_graph_index.append(user_graph_sample)
+
+                user_weight_matrix[i] = F.softmax(torch.tensor(user_graph_weight), dim=0)  # softmax
+                continue
+            user_graph_sample = self.user_graph_dict[i][0][:k]
+            user_graph_weight = self.user_graph_dict[i][1][:k]
+
+            user_weight_matrix[i] = F.softmax(torch.tensor(user_graph_weight), dim=0)  # softmax
+            user_graph_index.append(user_graph_sample)
+
+        # pdb.set_trace()
+        return user_graph_index, user_weight_matrix
+
+class GCN(torch.nn.Module):
+    def __init__(self, datasets, batch_size, num_user, num_item, dim_id, aggr_mode,
+                 dim_latent=None, device=None, features=None):
+        super(GCN, self).__init__()
+        self.batch_size = batch_size
+        self.num_user = num_user
+        self.num_item = num_item
+        self.datasets = datasets
+        self.dim_id = dim_id
+        self.dim_feat = features.size(1)
+        self.dim_latent = dim_latent
+        self.aggr_mode = aggr_mode
+        self.device = device
+
+        if self.dim_latent:
+            self.preference = nn.Parameter(nn.init.xavier_normal_(torch.tensor(
+                np.random.randn(num_user, self.dim_latent), dtype=torch.float32, requires_grad=True),
+                gain=1).to(self.device))
+            self.MLP = nn.Linear(self.dim_feat, 4 * self.dim_latent)
+            self.MLP_1 = nn.Linear(4 * self.dim_latent, self.dim_latent)
+            self.conv_embed_1 = Base_gcn(self.dim_latent, self.dim_latent, aggr=self.aggr_mode)
+
+        else:
+            self.preference = nn.Parameter(nn.init.xavier_normal_(torch.tensor(
+                np.random.randn(num_user, self.dim_feat), dtype=torch.float32, requires_grad=True),
+                gain=1).to(self.device))
+            self.conv_embed_1 = Base_gcn(self.dim_latent, self.dim_latent, aggr=self.aggr_mode)
+
+    def forward(self, edge_index_drop, edge_index, features, perturbed=False):
+        temp_features = self.MLP_1(F.leaky_relu(self.MLP(features))) if self.dim_latent else features
+        x = torch.cat((self.preference, temp_features), dim=0).to(self.device)
+        x = F.normalize(x).to(self.device)
+
+        h = self.conv_embed_1(x, edge_index)
+        if perturbed:
+            random_noise = torch.rand_like(h).cuda()
+            h += torch.sign(h) * F.normalize(random_noise, dim=-1) * 0.1
+        h_1 = self.conv_embed_1(h, edge_index)
+        if perturbed:
+            random_noise = torch.rand_like(h).cuda()
+            h_1 += torch.sign(h_1) * F.normalize(random_noise, dim=-1) * 0.1
+        # h_2 = self.conv_embed_1(h_1, edge_index)
+
+        x_hat = x + h + h_1
+        return x_hat, self.preference
+
+
+class Base_gcn(MessagePassing):
+    def __init__(self, in_channels, out_channels, normalize=True, bias=True, aggr='add', **kwargs):
+        super(Base_gcn, self).__init__(aggr=aggr, **kwargs)
+        self.aggr = aggr
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+    def forward(self, x, edge_index, size=None):
+        # pdb.set_trace()
+        if size is None:
+            edge_index, _ = remove_self_loops(edge_index)
+            # edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
+        x = x.unsqueeze(-1) if x.dim() == 1 else x
+        # pdb.set_trace()
+        return self.propagate(edge_index, size=(x.size(0), x.size(0)), x=x)
+
+    def message(self, x_j, edge_index, size):
+        if self.aggr == 'add':
+            # pdb.set_trace()
+            row, col = edge_index
+            deg = degree(row, size[0], dtype=x_j.dtype)
+            deg_inv_sqrt = deg.pow(-0.5)
+            norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]
+            return norm.view(-1, 1) * x_j
+        return x_j
+
+    def update(self, aggr_out):
+        return aggr_out
+
+    def __repr(self):
+        return '{}({},{})'.format(self.__class__.__name__, self.in_channels, self.out_channels)

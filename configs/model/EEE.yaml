@@ -1,0 +1,38 @@
+embedding_size: 64
+feat_embed_dim: 64
+
+n_mm_layers: 1
+n_layers: 2
+knn_k: 10
+mm_image_weight: 0.1
+learning_rate: [0.0001]
+reg_weight: [0.001]
+
+#dropout: [0.3 0.5]
+#dropout: [0.1, 0.3, 0.5, 0.7]
+dropout: [0.5]
+
+#mask_weight_f: [1, 2]
+#mask_weight_f: [1, 1.5, 2, 2.5, 3]
+mask_weight_f: [1.5]
+
+#mask_weight_g: [0, 0.01, 0.1]
+#mask_weight_g: [0.01, 0.001, 0]
+mask_weight_g: [0.001]
+
+#align_weight: [0.1, 0.2, 0.3]
+#align_weight: [0.1, 0.2, 0.3]
+
+#temp: [0.2, 0.4, 0.8]
+#temp: [0.2, 0.4, 0.6]
+#temp: [0.1]
+
+lambda_1 : [0.1] # GCN 前解耦损失权重
+
+# (新)
+lambda_2 : [0.1] # GCN 后解耦损失权重
+lambda_3 : [0.5] # GCN 前后一致性损失权重
+
+infoNCETemp : [0.1, 0.2]
+
+hyper_parameters: ["reg_weight", "learning_rate", 'dropout', 'mask_weight_f', 'mask_weight_g', 'lambda_1', 'lambda_2', 'lambda_3', 'infoNCETemp']
