@@ -27,6 +27,7 @@ if torch.cuda.is_available():
 config = {
     'dataset': 'baby',
     'data_path': '/root/autodl-tmp/code/TT2/data/',
+    # 'data_path': '/home/ljy/Documents/nwu/science/code/TT2/data/',
     'USER_ID_FIELD': 'userID',
     'ITEM_ID_FIELD': 'itemID',
     'inter_splitting_label': 'x_label',
