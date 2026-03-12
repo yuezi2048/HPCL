@@ -1,0 +1,14 @@
+# General dependencies
+tqdm==4.67.3
+numpy==1.26.4
+pandas==2.3.2
+scipy==1.13.1
+pyyaml==6.0.2
+lmdb==1.7.3
+matplotlib==3.9.4
+seaborn==0.13.2
+
+# PyTorch Geometric (Core)
+# Note: pyg_lib, torch_cluster, torch_scatter, torch_sparse, torch_spline_conv 
+# must be installed manually via specific whl files matching your PyTorch/CUDA version.
+torch-geometric==2.5.1
