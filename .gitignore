@@ -116,3 +116,9 @@ personal.yaml
 
 # omegaconf
 omegaconf.log
+
+./.idea
+
+./创新点文字
+
+./saved
