@@ -58,5 +58,11 @@ hidden_dropout_prob: 0.1
 
 end2end: False
 
+# t-SNE 可视化配置
+tsne_enabled: True           # 是否启用t-SNE可视化
+tsne_interval: 50             # 每隔多少个epoch生成一次t-SNE图
+tsne_sample_size: 500        # 采样物品数量
+tsne_perplexity: 30          # t-SNE的perplexity参数
+
 # iteration parameters
 hyper_parameters: ["seed"]

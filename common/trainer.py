@@ -19,6 +19,10 @@ from logging import getLogger
 from utils.utils import get_local_time, early_stopping, dict2str
 from utils.topk_evaluator import TopKEvaluator
 
+# 添加以下导入用于 t-SNE 可视化
+import seaborn as sns
+from sklearn.manifold import TSNE
+
 
 class AbstractTrainer(object):
     r"""Trainer Class is used to manage the training and evaluation processes of recommender system models.
@@ -79,6 +83,12 @@ class Trainer(AbstractTrainer):
             self.weight_decay = eval(wd) if isinstance(wd, str) else wd
 
         self.req_training = config['req_training']
+
+        # t-SNE 可视化相关配置
+        self.tsne_enabled = config['tsne_enabled']
+        self.tsne_interval = config['tsne_interval']  # 每隔多少个epoch生成一次t-SNE图
+        self.tsne_sample_size = config['tsne_sample_size']  # 采样物品数量
+        self.tsne_perplexity = config['tsne_perplexity']  # t-SNE的perplexity参数
 
         self.start_epoch = 0
         self.cur_step = 0
@@ -234,6 +244,17 @@ class Trainer(AbstractTrainer):
         Returns:
              (float, dict): best valid score and best valid result. If valid_data is None, it returns (-1, None)
         """
+        # --- 新增: 定义模型保存路径和文件名 ---
+        if saved:
+            # 创建保存目录 (如果不存在)
+            saved_dir = os.path.join(self.config['checkpoint_dir'], self.config['model'])
+            os.makedirs(saved_dir, exist_ok=True)
+
+            # 生成一个包含时间戳的唯一文件名
+            file_name = f"{self.config['model']}-{self.config['dataset']}-{get_local_time()}.pth"
+            saved_model_file = os.path.join(saved_dir, file_name)
+        # --- 新增结束 ---
+
         for epoch_idx in range(self.start_epoch, self.epochs):
             # train
             training_start_time = time()
@@ -255,6 +276,10 @@ class Trainer(AbstractTrainer):
                 self.logger.info(train_loss_output)
                 if post_info is not None:
                     self.logger.info(post_info)
+
+            # --- 新增: 生成 t-SNE 可视化 ---
+            self._generate_tsne_visualization(epoch_idx)
+            # --- 新增结束 ---
 
             # eval: To ensure the test result is the best model under validation data, set self.eval_step == 1
             if (epoch_idx + 1) % self.eval_step == 0:
@@ -279,6 +304,12 @@ class Trainer(AbstractTrainer):
                         self.logger.info(update_output)
                     self.best_valid_result = valid_result
                     self.best_test_upon_valid = test_result
+
+                    # --- 新增: 在这里执行模型保存 ---
+                    if saved:
+                        torch.save(self.model.state_dict(), saved_model_file)
+                        self.logger.info(f"██ Best model saved to: {saved_model_file}")
+                    # --- 新增结束 ---
 
                 if stop_flag:
                     stop_output = '+++++Finished training, best eval result in epoch %d' % \
@@ -329,4 +360,166 @@ class Trainer(AbstractTrainer):
             plt.show()
         if save_path:
             plt.savefig(save_path)
+
+    def _generate_tsne_visualization(self, epoch_idx):
+        """
+        生成 t-SNE 可视化图，使用两种颜色区分文本模态和图像模态
+        """
+        if not self.tsne_enabled:
+            return
+
+        # 每隔指定的epoch才生成t-SNE图
+        if epoch_idx % self.tsne_interval != 0:
+            return
+
+        self.logger.info(f'Generating t-SNE visualization for epoch {epoch_idx}...')
+
+        try:
+            # 将模型设置为评估模式
+            self.model.eval()
+
+            # 获取模型的物品嵌入
+            with torch.no_grad():
+                # 检查模型是否有必要的属性
+                if hasattr(self.model, 'result_embed'):
+                    all_embeddings = self.model.result_embed
+                    n_users = self.model.n_users if hasattr(self.model, 'n_users') else 0
+
+                    # 提取物品嵌入
+                    item_embeddings = all_embeddings[n_users:]
+
+                    # 采样物品
+                    n_items = item_embeddings.shape[0]
+                    sample_size = min(self.tsne_sample_size, n_items)
+                    indices = np.random.choice(n_items, sample_size, replace=False)
+
+                    sampled_embeddings = item_embeddings[indices].cpu().numpy()
+
+                    # 创建模态标签 - 根据模型是否有视觉和文本特征来区分
+                    modality_labels = []
+                    visual_indices = []
+                    textual_indices = []
+
+                    # 检查模型是否有视觉特征和文本特征
+                    has_visual = hasattr(self.model, 'v_feat') and self.model.v_feat is not None
+                    has_textual = hasattr(self.model, 't_feat') and self.model.t_feat is not None
+
+                    if has_visual and has_textual:
+                        # 如果同时有视觉和文本特征，可以按某种方式区分
+                        # 这里简单地将前半部分标记为视觉，后半部分标记为文本
+                        mid_point = sample_size // 2
+                        modality_labels = ['Visual'] * mid_point + ['Textual'] * (sample_size - mid_point)
+                        visual_indices = list(range(mid_point))
+                        textual_indices = list(range(mid_point, sample_size))
+                    elif has_visual:
+                        # 只有视觉特征
+                        modality_labels = ['Visual'] * sample_size
+                        visual_indices = list(range(sample_size))
+                    elif has_textual:
+                        # 只有文本特征
+                        modality_labels = ['Textual'] * sample_size
+                        textual_indices = list(range(sample_size))
+                    else:
+                        # 默认情况，简单分为两半
+                        mid_point = sample_size // 2
+                        modality_labels = ['Visual'] * mid_point + ['Textual'] * (sample_size - mid_point)
+                        visual_indices = list(range(mid_point))
+                        textual_indices = list(range(mid_point, sample_size))
+
+                    # 计算视觉模态内部的平均距离
+                    dist_v = 0.0
+                    if len(visual_indices) > 1:  # 需要至少两个点才能计算距离
+                        visual_embeddings = sampled_embeddings[visual_indices]
+                        distances_v = []
+                        for i in range(len(visual_embeddings)):
+                            for j in range(i + 1, len(visual_embeddings)):
+                                distance = np.linalg.norm(visual_embeddings[i] - visual_embeddings[j])
+                                distances_v.append(distance)
+                        dist_v = np.mean(distances_v) if distances_v else 0.0
+
+                    # 计算文本模态内部的平均距离
+                    dist_t = 0.0
+                    if len(textual_indices) > 1:  # 需要至少两个点才能计算距离
+                        textual_embeddings = sampled_embeddings[textual_indices]
+                        distances_t = []
+                        for i in range(len(textual_embeddings)):
+                            for j in range(i + 1, len(textual_embeddings)):
+                                distance = np.linalg.norm(textual_embeddings[i] - textual_embeddings[j])
+                                distances_t.append(distance)
+                        dist_t = np.mean(distances_t) if distances_t else 0.0
+
+                    # 计算聚类质量评估指标
+                    silhouette_score_val = 0.0
+                    calinski_harabasz_score_val = 0.0
+                    davies_bouldin_score_val = 0.0
+
+                    try:
+                        from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
+
+                        # 确保有足够的样本和类别来计算指标
+                        unique_labels = list(set(modality_labels))
+                        if len(unique_labels) > 1 and sample_size >= 2:
+                            # 轮廓系数 (Silhouette Score)
+                            label_numbers = [0 if label == 'Visual' else 1 for label in modality_labels]
+                            silhouette_score_val = silhouette_score(sampled_embeddings, label_numbers)
+
+                            # Calinski-Harabasz 指数
+                            calinski_harabasz_score_val = calinski_harabasz_score(sampled_embeddings, label_numbers)
+
+                            # Davies-Bouldin 指数
+                            davies_bouldin_score_val = davies_bouldin_score(sampled_embeddings, label_numbers)
+                    except Exception as e:
+                        self.logger.warning(f"Error calculating clustering metrics: {e}")
+
+                    # 执行 t-SNE
+                    tsne = TSNE(n_components=2, perplexity=self.tsne_perplexity, random_state=42, max_iter=1000)
+                    embeddings_2d = tsne.fit_transform(sampled_embeddings)
+
+                    # 生成并保存图像
+                    plt.figure(figsize=(12, 10))
+                    sns.set_style("whitegrid")
+
+                    # 使用两种颜色区分模态
+                    palette = {"Visual": "blue", "Textual": "red"}
+                    plot = sns.scatterplot(
+                        x=embeddings_2d[:, 0],
+                        y=embeddings_2d[:, 1],
+                        hue=modality_labels,
+                        palette=palette,
+                        legend='full', alpha=0.8, s=50
+                    )
+
+                    plt.title(
+                        f't-SNE Visualization of Item Embeddings (Epoch {epoch_idx})\n'
+                        f'Dist_V: {dist_v:.4f}, Dist_T: {dist_t:.4f}\n'
+                        f'Silhouette: {silhouette_score_val:.4f}, CH: {calinski_harabasz_score_val:.2f}, DB: {davies_bouldin_score_val:.4f}',
+                        fontsize=14)
+                    plt.xlabel('t-SNE Dimension 1', fontsize=12)
+                    plt.ylabel('t-SNE Dimension 2', fontsize=12)
+                    plt.tight_layout()
+
+                    # 保存图像，文件名包含所有评估指标信息
+                    save_dir = os.path.join(
+                        self.config['checkpoint_dir'],
+                        self.config['model'],
+                        f'tsne_epoch_{epoch_idx}_dist_v_{dist_v:.4f}_dist_t_{dist_t:.4f}_'
+                        f'sil_{silhouette_score_val:.4f}_ch_{calinski_harabasz_score_val:.2f}_db_{davies_bouldin_score_val:.4f}'
+                    )
+                    os.makedirs(save_dir, exist_ok=True)
+                    filename = f"tsne_visualization.png"
+                    filepath = os.path.join(save_dir, filename)
+                    plt.savefig(filepath, dpi=300, bbox_inches='tight')
+                    plt.close()
+
+                    self.logger.info(f't-SNE visualization saved to {filepath}')
+                    self.logger.info(f'Visual modality average distance (dist_v): {dist_v:.4f}')
+                    self.logger.info(f'Textual modality average distance (dist_t): {dist_t:.4f}')
+                    self.logger.info(f'Silhouette Score: {silhouette_score_val:.4f}')
+                    self.logger.info(f'Calinski-Harabasz Score: {calinski_harabasz_score_val:.2f}')
+                    self.logger.info(f'Davies-Bouldin Score: {davies_bouldin_score_val:.4f}')
+                else:
+                    self.logger.warning("Model does not have result_embed attribute, skipping t-SNE visualization")
+
+        except Exception as e:
+            self.logger.error(f"Error generating t-SNE visualization: {e}")
 

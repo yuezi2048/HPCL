@@ -25,12 +25,12 @@ if torch.cuda.is_available():
 
 # --- 配置 ---
 config = {
-    'dataset': 'baby',
+    'dataset': 'clothing',
     'data_path': '/root/autodl-tmp/code/TT2/data/',
     'USER_ID_FIELD': 'userID',
     'ITEM_ID_FIELD': 'itemID',
     'inter_splitting_label': 'x_label',
-    'inter_file_name': 'baby.inter',
+    'inter_file_name': 'clothing.inter',
     'field_separator': '\t',
     'filter_out_cod_start_users': False
 }

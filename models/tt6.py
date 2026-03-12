@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import random
 
 from models.GCN import GCN
 from common.abstract_recommender import GeneralRecommender
@@ -151,11 +152,6 @@ class TT6(GeneralRecommender):
         if self.t_feat is not None:
             self.t_gcn = GCN(self.dataset, batch_size, num_user, num_item, dim_x, self.aggr_mode, dim_latent=64,
                              device=self.device, features=self.t_feat)
-
-        self.result_embed_n1 = nn.Parameter(
-            nn.init.xavier_normal_(torch.tensor(np.random.randn(num_user + num_item, dim_x)))).to(self.device)
-        self.result_embed_n2 = nn.Parameter(
-            nn.init.xavier_normal_(torch.tensor(np.random.randn(num_user + num_item, dim_x)))).to(self.device)
 
         # =================================================================
         # DGMRec 解耦模块 (简化版) START
@@ -470,7 +466,7 @@ class TT6(GeneralRecommender):
         """
         计算模型的总损失（所有损失逻辑合并后的版本）。
         """
-        # 1. 前向传播，获取推荐分数并计算中间表示 (self.user_rep, self.result_embed_n1等)
+        # 1. 前向传播，获取推荐分数并计算中间表示 (self.user_rep)
         user, pos_items, neg_items = interaction
         pos_scores, neg_scores = self.forward(interaction)
 

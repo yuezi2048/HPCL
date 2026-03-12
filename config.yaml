@@ -1,0 +1,61 @@
+# ======================================================
+# General Settings (from overall.yaml)
+# ======================================================
+gpu_id: 0
+use_gpu: True
+seed: [999]
+
+# --- 路径设置 ---
+# !!! 请确保此路径是正确的 !!!
+data_path: '../data/'
+checkpoint_dir: 'saved'
+
+# --- 训练设置 ---
+epochs: 1000
+stopping_step: 20
+train_batch_size: 2048
+learner: adam
+eval_step: 1
+weight_decay: 0.0
+
+# --- 评估设置 ---
+metrics: ["Recall", "NDCG"] # 简化以匹配之前的脚本
+topk: [10, 20]             # 简化以匹配之前的脚本
+valid_metric: NDCG@20      # 简化以匹配之前的脚本
+eval_batch_size: 4096
+
+# --- 数据集字段 ---
+USER_ID_FIELD: userID # 修正以匹配 'baby' 数据集格式
+ITEM_ID_FIELD: itemID # 修正以匹配 'baby' 数据集格式
+field_separator: "\t"
+inter_splitting_label: 'x_label'
+filter_out_cod_start_users: False
+is_multimodal_model: True
+vision_feature_file: 'vision_feat.npy'
+text_feature_file: 'text_feat.npy'
+inter_file_name: 'baby.inter'
+user_graph_dict_file: 'user_graph_dict_10.npy'
+end2end: False
+
+# ======================================================
+# Model-Specific Settings (from TT6.yaml)
+# ======================================================
+embedding_size: 64
+feat_embed_dim: 64
+n_mm_layers: 1
+n_layers: 2
+knn_k: 10
+mm_image_weight: 0.1
+
+# ======================================================
+# Hyperparameter Tuning Settings (Merged)
+# ======================================================
+# 以下参数用于超参数搜索，它们的值都是列表
+learning_rate: [0.0001]
+reg_weight: [0.0001]
+infoNCETemp: [0.1, 0.2, 0.4]          # 稍微缩减列表以便快速测试
+lambda_graded_align: [0.05, 0.1, 0.2] # 稍微缩减列表以便快速测试
+alpha_g_s: [0.6]
+
+# 这是合并后的超参数列表，运行脚本将根据此列表进行循环搜索
+hyper_parameters: ["seed", "reg_weight", "learning_rate", 'infoNCETemp', "lambda_graded_align",  "alpha_g_s"]
