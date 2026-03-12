@@ -124,3 +124,5 @@ omegaconf.log
 ./saved
 
 ./log
+
+./visual/output
