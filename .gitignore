@@ -111,9 +111,6 @@ personal.yaml
 # pyenv
 .python-version
 
-# pip-compile
-requirements*.txt
-
 # hydra
 .hydra/
 
