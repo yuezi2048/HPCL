@@ -11,9 +11,9 @@ reg_weight: [0.0001]
 dropout: [0.5]
 mask_weight_f: [1.5]
 mask_weight_g: [0.001]
-infoNCETemp: [0.4]
+infoNCETemp: [0.2]
 
-lambda_graded_align: [0.6]
+lambda_graded_align: [0.2]
 alpha_g_s: [0.7]
 
 hyper_parameters: ["reg_weight", "learning_rate", 'dropout', 'mask_weight_f', 'mask_weight_g', 'infoNCETemp', "lambda_graded_align",  "alpha_g_s"]
