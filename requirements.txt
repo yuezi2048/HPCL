@@ -7,6 +7,8 @@ pyyaml==6.0.2
 lmdb==1.7.3
 matplotlib==3.9.4
 seaborn==0.13.2
+igraph==0.11.9
+leidenalg==0.10.2
 
 # PyTorch Geometric (Core)
 # Note: pyg_lib, torch_cluster, torch_scatter, torch_sparse, torch_spline_conv 

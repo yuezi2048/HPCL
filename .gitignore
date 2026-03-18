@@ -97,7 +97,7 @@ figures/
 *.jpg
 *.jpeg
 *.svg
-!visual/output/Code_Generated_Image.png
+!saved/grid/Code_Generated_Image.png
 
 # Local configuration
 local_config.yaml

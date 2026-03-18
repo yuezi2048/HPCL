@@ -9,7 +9,7 @@ from sklearn.decomposition import PCA
 from sklearn.metrics.pairwise import cosine_similarity
 
 # --- 导入您的 Dataset 类 ---
-from utils.dataset import RecDataset
+from dataset import RecDataset
 
 # --- ↓↓↓ 添加下面的代码块 ↓↓↓ ---
 import random
@@ -81,7 +81,8 @@ print("在融合图上执行Leiden社区发现...")
 # Leiden算法使用 igraph 对象，而不是 networkx
 # 从边列表直接创建 igraph 图
 edges = list(zip(A_fused.row, A_fused.col))
-G_ig = ig.Graph(edges=edges, directed=False)
+# 【核心修复】：必须传入 n=n_items，强制图的节点数与全局真实商品数一致，避免孤立节点导致索引错乱！
+G_ig = ig.Graph(n=n_items, edges=edges, directed=False)
 
 # 执行Leiden算法
 # find_partition 返回一个划分对象
@@ -106,7 +107,19 @@ print(f"阶段一完成！发现 {num_macro_communities} 个宏观社区。")
 # =================================================================================
 print("\n--- 阶段二：开始在宏观社区内进行自适应K-Means细分 ---")
 # 1. 加载用于K-Means的文本特征
+# 【核心修复】：加载视觉与文本双模态特征，并进行 L2 归一化拼接，实现真正的多模态细分
 text_features = np.load(text_feat_path)
+image_feat_path = os.path.join(dataset_path, 'image_feat.npy')
+
+if os.path.exists(image_feat_path):
+    image_features = np.load(image_feat_path)
+    # 归一化以防止某一模态的绝对数值过大而主导 K-Means 距离
+    text_features = text_features / (np.linalg.norm(text_features, axis=1, keepdims=True) + 1e-8)
+    image_features = image_features / (np.linalg.norm(image_features, axis=1, keepdims=True) + 1e-8)
+    fused_features = np.concatenate([text_features, image_features], axis=1)
+else:
+    print("警告：未找到 image_feat.npy，模型将退化为仅依赖文本的聚类！")
+    fused_features = text_features
 
 # 2. 将物品按宏观社区分组
 communities = {}
@@ -138,21 +151,15 @@ for macro_id, items_in_macro in communities.items():
         total_clusters += 1
         continue
 
-    # 提取该社区内所有物品的文本特征
-    community_features = text_features[items_in_macro]
+    # 【核心修复】：提取融合后的双模态特征
+    community_features = fused_features[items_in_macro]
 
-    # --- 新增: PCA降维 ---
-    # 只有当特征维度较高且物品较多时才执行
-    if community_features.shape[1] > 128 and len(items_in_macro) > 128:
-        print("    -> 正在执行PCA降维...")
-        # --- ↓↓↓ 修改这一行 ↓↓↓ ---
-        # 原代码:
-        # pca = PCA(n_components=128)
-        # 修改后:
-        pca = PCA(n_components=128, random_state=SEED)
-        # --- ↑↑↑ 修改结束 ↑↑↑ ---
+    # 【核心修复】：调整 PCA 逻辑，目标维度必须远小于样本数，避免 K-Means 维度灾难失效
+    if community_features.shape[1] > 32 and num_items_in_macro > 50:
+        # 动态决定维度：最大32维，且不超过当前簇样本数的 1/3
+        target_dims = min(32, num_items_in_macro // 3)
+        pca = PCA(n_components=target_dims, random_state=SEED)
         community_features = pca.fit_transform(community_features)
-    # --- 新增结束 ---
 
     # 使用动态计算的k值进行K-Means聚类
     # --- ↓↓↓ 修改这一行 ↓↓↓ ---

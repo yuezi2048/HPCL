@@ -60,7 +60,7 @@ plt.text(2, -0.7, r'Baby - ($infoNCETemp, \lambda_{graded\_align}$)', # 更新�
 plt.tight_layout(rect=[0, 0, 1, 0.95])
 
 # 保存图片到文件
-output_filename = './output/heatmap_baby_infonce_lambda.png'  # 更新文件名
+output_filename = 'saved/grid/heatmap_baby_infonce_lambda.png'  # 更新文件名
 plt.savefig(output_filename, dpi=300, bbox_inches='tight')
 
 print(f"Heatmap has been saved to '{output_filename}'")
