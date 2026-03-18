@@ -60,9 +60,9 @@ end2end: False
 
 # t-SNE 可视化配置
 tsne_enabled: True           # 是否启用t-SNE可视化
-tsne_interval: 50             # 每隔多少个epoch生成一次t-SNE图
-tsne_sample_size: 500        # 采样物品数量
-tsne_perplexity: 30          # t-SNE的perplexity参数
+tsne_sample_size: 1200          # 增加采样，结构更清晰
+tsne_perplexity: 40             # 30 → 40 或 50，对分散数据更友好
+tsne_interval: 20               # 更频繁观察趋势
 
 # iteration parameters
 hyper_parameters: ["seed"]

@@ -1,17 +1,19 @@
 # coding: utf-8
 import os
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import random
 
 from models.GCN import GCN
 from common.abstract_recommender import GeneralRecommender
 from utils.mi_estimator import CLUBSample
 
-class TT4PRO(GeneralRecommender):
+class TT6PRO(GeneralRecommender):
     def __init__(self, config, dataset):
-        super(TT4PRO, self).__init__(config, dataset)
+        super(TT6PRO, self).__init__(config, dataset)
 
         num_user = self.n_users
         num_item = self.n_items
@@ -28,11 +30,9 @@ class TT4PRO(GeneralRecommender):
         self.k = 40
         self.aggr_mode = 'add'
         self.dataset = dataset
-        self.dropout = config['dropout']
         # self.construction = 'weighted_max'
         self.reg_weight = config['reg_weight']
-        self.align_weight = config['align_weight']
-        self.mask_weight_g = config['mask_weight_g']
+
         self.infoNCETemp = config['infoNCETemp']
         self.drop_rate = 0.1
         self.lambda_graded_align = config['lambda_graded_align'] # 兼容旧配置
@@ -45,8 +45,6 @@ class TT4PRO(GeneralRecommender):
         self.dim_latent = 64
         self.dim_feat = 128
         self.mm_adj = None
-
-        self.mlp = nn.Linear(2*dim_x, 2*dim_x)
 
         dataset_path = os.path.abspath(config['data_path'] + config['dataset'])
 
@@ -71,8 +69,10 @@ class TT4PRO(GeneralRecommender):
 
         if self.v_feat is not None:
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
+            self.image_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
         if self.t_feat is not None:
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
+            self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
 
         if os.path.exists(mm_adj_file):
             self.mm_adj = torch.load(mm_adj_file)
@@ -144,23 +144,14 @@ class TT4PRO(GeneralRecommender):
         self.edge_index_dropv = torch.cat((self.edge_index_dropv, self.edge_index_dropv[[1, 0]]), dim=1)
         self.edge_index_dropt = torch.cat((self.edge_index_dropt, self.edge_index_dropt[[1, 0]]), dim=1)
 
+        self.MLP_user = nn.Linear(self.dim_latent * 2, self.dim_latent)
+
         if self.v_feat is not None:
             self.v_gcn = GCN(self.dataset, batch_size, num_user, num_item, dim_x, self.aggr_mode, dim_latent=64,
                              device=self.device, features=self.v_feat)
         if self.t_feat is not None:
             self.t_gcn = GCN(self.dataset, batch_size, num_user, num_item, dim_x, self.aggr_mode, dim_latent=64,
                              device=self.device, features=self.t_feat)
-
-        # self.id_feat = nn.Parameter(
-        #     nn.init.xavier_normal_(torch.tensor(np.random.randn(self.n_items, self.dim_latent), dtype=torch.float32,
-        #                                         requires_grad=True), gain=1).to(self.device))
-        # self.id_gcn = GCN(self.dataset, batch_size, num_user, num_item, dim_x, self.aggr_mode,
-        #                   dim_latent=64, device=self.device, features=self.id_feat)
-        #
-        # self.result_embed_n1 = nn.Parameter(
-        #     nn.init.xavier_normal_(torch.tensor(np.random.randn(num_user + num_item, dim_x)))).to(self.device)
-        # self.result_embed_n2 = nn.Parameter(
-        #     nn.init.xavier_normal_(torch.tensor(np.random.randn(num_user + num_item, dim_x)))).to(self.device)
 
         # =================================================================
         # DGMRec 解耦模块 (简化版) START
@@ -196,12 +187,6 @@ class TT4PRO(GeneralRecommender):
         # DGMRec 解耦模块 (简化版) END
         # =================================================================
 
-        # 在 __init__ 尾部添加
-        num_communities = torch.max(self.item_community_map).item() + 1
-        self.register_buffer('global_prototypes_v', torch.zeros(num_communities, self.embedding_dim))
-        self.register_buffer('global_prototypes_t', torch.zeros(num_communities, self.embedding_dim))
-
-
     def get_knn_adj_mat(self, mm_embeddings):
         context_norm = mm_embeddings.div(torch.norm(mm_embeddings, p=2, dim=-1, keepdim=True))
         sim = torch.mm(context_norm, context_norm.transpose(1, 0))
@@ -229,95 +214,31 @@ class TT4PRO(GeneralRecommender):
         self.epoch_user_graph, self.user_weight_matrix = self.topk_sample(self.k)
         self.user_weight_matrix = self.user_weight_matrix.to(self.device)
 
-        # 【新增】1. 预计算全局原型 (无梯度)
-        with torch.no_grad():
-            _, _, item_image_s, item_text_s = self.mge()
-            num_communities = self.global_prototypes_v.shape[0]
-            for m_feat, proto_buffer in zip([item_image_s, item_text_s],
-                                            [self.global_prototypes_v, self.global_prototypes_t]):
-                sum_feats = torch.zeros(num_communities, self.embedding_dim, device=self.device)
-                sum_feats.index_add_(0, self.item_community_map, m_feat)
-                counts = torch.bincount(self.item_community_map, minlength=num_communities).unsqueeze(1).clamp(min=1)
-                proto_buffer.copy_(F.normalize(sum_feats / counts, dim=1))
-
         # =================================================================
-        # DGMRec MI 估计器训练（保持 3 次更高效）
+        # DGMRec MI 估计器训练 START
         # =================================================================
-        with torch.no_grad():
-            item_image_g, item_text_g, item_image_s, item_text_s = self.mge()
+        # (我们必须先生成 G/S 嵌入来训练估计器)
+        item_image_g, item_text_g, item_image_s, item_text_s = self.mge()  #
 
-        for _ in range(3):  # ← 从5改成3，节省时间
-            self.item_image_estimator.train()
-            self.item_text_estimator.train()
+        # DGM 默认训练 5 次
+        for _ in range(5):
+            self.item_image_estimator.train();
+            self.item_text_estimator.train()  #
 
+            # (DGM 使用 2048，如果项目数较少，请调整此值)
             item_rand_idx = torch.randperm(self.n_items)[:2048].to(self.device)
-            loss_mi = (self.item_image_estimator.learning_loss(item_image_s[item_rand_idx],
-                                                               item_image_g[item_rand_idx]) +
-                       self.item_text_estimator.learning_loss(item_text_s[item_rand_idx], item_text_g[item_rand_idx]))
+
+            loss_mi = 0.0
+            # 计算 CLUB 学习损失
+            loss_mi += self.item_image_estimator.learning_loss(item_image_s[item_rand_idx], item_image_g[item_rand_idx])
+            loss_mi += self.item_text_estimator.learning_loss(item_text_s[item_rand_idx], item_text_g[item_rand_idx])
 
             self.optimizer_club.zero_grad()
-            loss_mi.backward(retain_graph=True)
+            loss_mi.backward(retain_graph=True)  # 必须保留图，因为 mge() 的输出稍后会用于主损失
             self.optimizer_club.step()
 
-        self.item_image_estimator.eval()
-        self.item_text_estimator.eval()
-
-        # =================================================================
-        # 👑 终极升级 1：语义引导的自适应节点丢弃 (Semantic-Guided Node Dropout)
-        # =================================================================
-        with torch.no_grad():
-            # 1. 获取所有物品的特有特征 (S)
-            _, _, item_image_s, item_text_s = self.mge()
-            s_v = F.normalize(item_image_s, dim=1)
-            s_t = F.normalize(item_text_s, dim=1)
-
-            # 2. 查表获取每个物品对应的全局群体原型
-            c_v = self.global_prototypes_v[self.item_community_map]
-            c_t = self.global_prototypes_t[self.item_community_map]
-
-            # 3. 计算语义偏离度 (Semantic Deviation)
-            # 偏离度越大（内积越小），说明该节点是社区边缘的噪声节点，应以更高概率被丢弃 (Drop)
-            # 偏离度越小，说明是社区核心节点，应被保护以维持语义纯度
-            dev_v = 1.0 - (s_v * c_v).sum(dim=1)
-            dev_t = 1.0 - (s_t * c_t).sum(dim=1)
-            semantic_deviation = dev_v + dev_t
-
-            # 4. 将偏离度转化为丢弃概率分布 (加温度系数 0.5 平滑分布)
-            drop_prob = F.softmax(semantic_deviation / 0.5, dim=0)
-
-            # 5. 根据语义概率分布，自适应采样要丢弃的节点！
-            num_drop = int(self.n_items * self.drop_rate)
-            drop_item = torch.multinomial(drop_prob, num_samples=num_drop, replacement=False)
-
-        single_cnt = int(len(drop_item) * self.single_percent)
-        drop_item_single = drop_item[:single_cnt]
-
-        self.dropv_node_idx_single = drop_item_single[:len(drop_item_single) // 3]
-        self.dropt_node_idx_single = drop_item_single[len(drop_item_single) // 3: 2 * len(drop_item_single) // 3]
-
-        # =================================================================
-        # 👑 性能优化：纯 GPU 向量化图节点 Dropout (彻底释放 CPU)
-        # =================================================================
-        # 1. 提取前一半的单向原始边
-        half_size = self.edge_index.shape[1] // 2
-        edge_index_single = self.edge_index[:, :half_size]
-
-        # 2. 提取边的目标节点 (Item ID)
-        # 假设 edge_index 的格式是 [user, item_with_offset]，我们将 item 偏移还原
-        target_nodes = edge_index_single[1] - self.num_user
-
-        # 3. 纯 GPU 并行判断：保留那些目标节点 *不在* 丢弃列表中的边
-        # 使用 torch.isin 直接在 GPU 上进行极速集合匹配
-        keep_mask_v = ~torch.isin(target_nodes, self.dropv_node_idx_single)
-        keep_mask_t = ~torch.isin(target_nodes, self.dropt_node_idx_single)
-
-        # 4. 直接利用布尔掩码在 GPU 上过滤边
-        self.edge_index_dropv = edge_index_single[:, keep_mask_v]
-        self.edge_index_dropt = edge_index_single[:, keep_mask_t]
-
-        # 5. 过滤完成后，再次拼接反向边，恢复模型的双向图要求
-        self.edge_index_dropv = torch.cat((self.edge_index_dropv, self.edge_index_dropv[[1, 0]]), dim=1)
-        self.edge_index_dropt = torch.cat((self.edge_index_dropt, self.edge_index_dropt[[1, 0]]), dim=1)
+        self.item_image_estimator.eval();
+        self.item_text_estimator.eval()  #
 
 
     # =================================================================
@@ -331,11 +252,13 @@ class TT4PRO(GeneralRecommender):
         return np.column_stack((rows, cols))
 
     def InfoNCE(self, view1, view2, temp):
-        # 【修复】使用 PyTorch 底层优化的 cross_entropy 实现 InfoNCE
         view1, view2 = F.normalize(view1, dim=1), F.normalize(view2, dim=1)
-        sim_matrix = torch.matmul(view1, view2.transpose(0, 1)) / temp
-        labels = torch.arange(view1.shape[0], device=self.device)
-        return F.cross_entropy(sim_matrix, labels)
+        pos_score = (view1 * view2).sum(dim=-1)
+        pos_score = torch.exp(pos_score / temp)
+        ttl_score = torch.matmul(view1, view2.transpose(0, 1))
+        ttl_score = torch.exp(ttl_score / temp).sum(dim=1)
+        cl_loss = -torch.log(pos_score / ttl_score)
+        return torch.mean(cl_loss)
 
     # =================================================================
     # DGMRec 辅助函数 (简化版) START
@@ -369,6 +292,7 @@ class TT4PRO(GeneralRecommender):
         # 特定(Specific)特征 S
         item_image_s = torch.sigmoid(self.image_encoder_s(self.image_embedding.weight))
         item_text_s = torch.sigmoid(self.text_encoder_s(self.text_embedding.weight))
+
         return item_image_g, item_text_g, item_image_s, item_text_s
 
         # =================================================================
@@ -408,29 +332,16 @@ class TT4PRO(GeneralRecommender):
         self.v_rep, self.v_preference = self.v_gcn(self.edge_index_dropv, self.edge_index, self.v_feat)
         self.t_rep, self.t_preference = self.t_gcn(self.edge_index_dropt, self.edge_index, self.t_feat)
 
-        # 噪声视图 1
-        v_rep_n1, _ = self.v_gcn(self.edge_index_dropv, self.edge_index, self.v_feat, perturbed=True)
-        t_rep_n1, _ = self.t_gcn(self.edge_index_dropt, self.edge_index, self.t_feat, perturbed=True)
-
-        # 噪声视图 2
-        v_rep_n2, _ = self.v_gcn(self.edge_index_dropv, self.edge_index, self.v_feat, perturbed=True)
-        t_rep_n2, _ = self.t_gcn(self.edge_index_dropt, self.edge_index, self.t_feat, perturbed=True)
-
         # 2. 调用辅助方法来生成最终嵌入
         # 主嵌入 (需要保存 user_rep 和 item_rep 用于 mask_f_loss)
         self.result_embed, self.user_rep, self.item_rep = self._generate_representations(self.v_rep, self.t_rep)
 
-        # 噪声嵌入
-        self.result_embed_n1, _, _ = self._generate_representations(v_rep_n1, t_rep_n1)
-        self.result_embed_n2, _, _ = self._generate_representations(v_rep_n2, t_rep_n2)
-
         # 3. 计算分数用于 BPR 损失
-        # 【修复】使用局部变量计算偏移，绝对不要修改传入的 pos_item_nodes
-        pos_item_nodes_shifted = pos_item_nodes + self.n_users
-        neg_item_nodes_shifted = neg_item_nodes + self.n_users
+        pos_item_nodes += self.n_users
+        neg_item_nodes += self.n_users
         user_tensor = self.result_embed[user_nodes]
-        pos_item_tensor = self.result_embed[pos_item_nodes_shifted]
-        neg_item_tensor = self.result_embed[neg_item_nodes_shifted]
+        pos_item_tensor = self.result_embed[pos_item_nodes]
+        neg_item_tensor = self.result_embed[neg_item_nodes]
         pos_scores = torch.sum(user_tensor * pos_item_tensor, dim=1)
         neg_scores = torch.sum(user_tensor * neg_item_tensor, dim=1)
         return pos_scores, neg_scores
@@ -440,65 +351,14 @@ class TT4PRO(GeneralRecommender):
             h = torch.sparse.mm(self.mm_adj, h)
         return h
 
-    # def _find_graded_samples(self, batch_items, item_image_g, item_text_g, item_image_s, item_text_s, k=10):
-    #     """
-    #     为批次中的每个物品动态识别分级样本。
-    #     - 强正样本 (R): 通用特征在两个模态上都相似。
-    #     - 弱正样本 (T_v, T_t): 特定特征在一个模态上相似，在另一个模态上不相似。
-    #     """
-    #     # 1. 提取当前批次的物品特征并进行归一化
-    #     batch_size = len(batch_items)
-    #     device = batch_items.device
-    #
-    #     g_v = F.normalize(item_image_g[batch_items], dim=1)
-    #     g_t = F.normalize(item_text_g[batch_items], dim=1)
-    #     s_v = F.normalize(item_image_s[batch_items], dim=1)
-    #     s_t = F.normalize(item_text_s[batch_items], dim=1)
-    #
-    #     # 2. 计算所有相似度矩阵
-    #     sim_g_v = g_v @ g_v.T
-    #     sim_g_t = g_t @ g_t.T
-    #     sim_s_v = s_v @ s_v.T
-    #     sim_s_t = s_t @ s_t.T
-    #
-    #     # 创建一个对角线为-inf的掩码，防止物品将自己选为邻居
-    #     self_mask = torch.eye(batch_size, dtype=torch.bool, device=device)
-    #
-    #     # 3. 识别强正样本 (Multi-modal Similar, R)
-    #     score_multi = sim_g_v * sim_g_t
-    #     score_multi.masked_fill_(self_mask, -torch.inf)
-    #     _, R_indices = torch.topk(score_multi, k=min(k, batch_size - 1), dim=1)
-    #
-    #     # 4. 识别弱正样本 (Single-modal Similar, T_v, T_t)
-    #     # 创建一个掩码，排除已经被选为强正样本的物品
-    #     R_mask = torch.zeros_like(score_multi, dtype=torch.bool).scatter_(1, R_indices, True)
-    #     R_mask.logical_or_(self_mask)  # 同时也排除自己
-    #
-    #     # 视觉弱正样本 T_v
-    #     score_single_v = sim_s_v * (1 - sim_s_t)
-    #     score_single_v.masked_fill_(R_mask, -torch.inf)
-    #     _, T_v_indices = torch.topk(score_single_v, k=min(k, batch_size - 1 - k), dim=1)
-    #
-    #     # 文本弱正样本 T_t
-    #     score_single_t = sim_s_t * (1 - sim_s_v)
-    #     score_single_t.masked_fill_(R_mask, -torch.inf)
-    #     _, T_t_indices = torch.topk(score_single_t, k=min(k, batch_size - 1 - k), dim=1)
-    #
-    #     # 5. 返回结果
-    #     # 返回的是在当前 batch 内的相对索引
-    #     return {
-    #         'R': R_indices,
-    #         'T_v': T_v_indices,
-    #         'T_t': T_t_indices
-    #     }
-
     def _find_graded_samples(self, batch_items, item_image_g, item_text_g, item_image_s, item_text_s, k=10):
+        """
+        为批次中的每个物品动态识别分级样本。
+        - 强正样本 (R): 通用特征在两个模态上都相似。
+        - 弱正样本 (T_v, T_t): 特定特征在一个模态上相似，在另一个模态上不相似。
+        """
+        # 1. 提取当前批次的物品特征并进行归一化
         batch_size = len(batch_items)
-        if batch_size < 3:
-            # 样本太少，直接返回空索引（避免崩溃）
-            empty = torch.empty((batch_size, 0), dtype=torch.long, device=batch_items.device)
-            return {'R': empty, 'T_v': empty, 'T_t': empty}
-
         device = batch_items.device
 
         g_v = F.normalize(item_image_g[batch_items], dim=1)
@@ -506,103 +366,107 @@ class TT4PRO(GeneralRecommender):
         s_v = F.normalize(item_image_s[batch_items], dim=1)
         s_t = F.normalize(item_text_s[batch_items], dim=1)
 
+        # 2. 计算所有相似度矩阵
         sim_g_v = g_v @ g_v.T
         sim_g_t = g_t @ g_t.T
         sim_s_v = s_v @ s_v.T
         sim_s_t = s_t @ s_t.T
 
+        # 创建一个对角线为-inf的掩码，防止物品将自己选为邻居
         self_mask = torch.eye(batch_size, dtype=torch.bool, device=device)
 
-        # 强正样本
+        # 3. 识别强正样本 (Multi-modal Similar, R)
         score_multi = sim_g_v * sim_g_t
-        score_multi.masked_fill_(self_mask, -float('inf'))
+        score_multi.masked_fill_(self_mask, -torch.inf)
         _, R_indices = torch.topk(score_multi, k=min(k, batch_size - 1), dim=1)
 
-        # 排除已选强正 + 自身
+        # 4. 识别弱正样本 (Single-modal Similar, T_v, T_t)
+        # 创建一个掩码，排除已经被选为强正样本的物品
         R_mask = torch.zeros_like(score_multi, dtype=torch.bool).scatter_(1, R_indices, True)
-        R_mask.logical_or_(self_mask)
+        R_mask.logical_or_(self_mask)  # 同时也排除自己
 
-        # 弱正样本 - 视觉
-        sim_s_v_norm = (sim_s_v + 1) / 2
-        sim_s_t_norm = (sim_s_t + 1) / 2
-        penalty_t = torch.clamp(1 - sim_s_t_norm, min=0.0)
-        score_single_v = sim_s_v * penalty_t
-        # 【核心修复】：使用原地的 masked_fill_ 替代 torch.where，完美避开数据类型冲突
-        score_single_v.masked_fill_(score_single_v <= 0.1, -float('inf'))
-        score_single_v.masked_fill_(R_mask, -float('inf'))
+        # 视觉弱正样本 T_v
+        score_single_v = sim_s_v * (1 - sim_s_t)
+        score_single_v.masked_fill_(R_mask, -torch.inf)
+        _, T_v_indices = torch.topk(score_single_v, k=min(k, batch_size - 1 - k), dim=1)
 
-        t_k_v = max(1, min(k, batch_size - 1 - R_indices.shape[1]))  # 防止负数
-        _, T_v_indices = torch.topk(score_single_v, k=t_k_v, dim=1)
+        # 文本弱正样本 T_t
+        score_single_t = sim_s_t * (1 - sim_s_v)
+        score_single_t.masked_fill_(R_mask, -torch.inf)
+        _, T_t_indices = torch.topk(score_single_t, k=min(k, batch_size - 1 - k), dim=1)
 
-        # 弱正样本 - 文本（同理）
-        penalty_v = torch.clamp(1 - sim_s_v_norm, min=0.0)
-        score_single_t = sim_s_t * penalty_v
-        # 【核心修复】：同上
-        score_single_t.masked_fill_(score_single_t <= 0.1, -float('inf'))
-        score_single_t.masked_fill_(R_mask, -float('inf'))
-
-        t_k_t = max(1, min(k, batch_size - 1 - R_indices.shape[1]))
-        _, T_t_indices = torch.topk(score_single_t, k=t_k_t, dim=1)
-
+        # 5. 返回结果
+        # 返回的是在当前 batch 内的相对索引
         return {
             'R': R_indices,
             'T_v': T_v_indices,
             'T_t': T_t_indices
         }
 
+    # --- 核心改动: 添加新的辅助函数 ---
     def _calculate_prototype_contrastive_loss(self, student_feats, graded_samples, batch_community_ids,
-                                              sample_weights, modality_type: str, temp=0.2):
+                                              modality_type: str, temp=0.2):
         """
         (新) 计算同时包含实例和原型对比的、并由样本难度加权的损失函数
+        灵感来源: CoUDA, PCKD
         """
         student_feats = F.normalize(student_feats, dim=1)
 
-        # ==========================================================
-        # 【终极修复】：绝对不能在 batch 内现场算原型！
-        # 必须查表获取 pre_epoch_processing 中算好的 "全局软锚点"
-        # ==========================================================
-        if modality_type == 'visual':
-            global_protos = self.global_prototypes_v
-        elif modality_type == 'textual':
-            global_protos = self.global_prototypes_t
-        else:
-            raise ValueError("modality_type 必须是 'visual' 或 'textual'")
+        # --- 1. 计算社区原型 ---
+        unique_communities, inverse_indices = torch.unique(batch_community_ids, return_inverse=True)
+        prototypes = torch.zeros(len(unique_communities), student_feats.shape[1], device=student_feats.device)
+        prototypes.index_add_(0, inverse_indices, student_feats)
+        comm_counts = torch.bincount(inverse_indices)
+        prototypes = F.normalize(prototypes / comm_counts.unsqueeze(1).clamp(min=1), dim=1)
 
         # --- 2. 实例级和原型级相似度计算 ---
         sim_instance_matrix = student_feats @ student_feats.T / temp
-        # 【修复】：使用全局原型矩阵计算相似度
-        sim_proto_matrix = student_feats @ global_protos.T / temp
+        sim_proto_matrix = student_feats @ prototypes.T / temp
 
         # --- 3. 构造分子 (正样本) ---
         R_indices = graded_samples['R']
-        if modality_type == 'visual':
+        # 根据当前处理的特征类型，选择对应的弱正样本
+        if graded_samples['T_v'].shape == R_indices.shape:
             T_indices = graded_samples['T_v']
         else:
             T_indices = graded_samples['T_t']
 
+        # 修改为
+        if modality_type == 'visual':
+            T_indices = graded_samples['T_v']
+        elif modality_type == 'textual':
+            T_indices = graded_samples['T_t']
+        else:
+            raise ValueError("modality_type 必须是 'visual' 或 'textual'")
+
         pos_instance_sim = torch.gather(torch.exp(sim_instance_matrix), 1, R_indices).sum(dim=1) + \
                            torch.gather(torch.exp(sim_instance_matrix), 1, T_indices).sum(dim=1)
 
-        # 【修复】：直接根据物品的社区 ID 索引对应的全局原型
-        proto_indices_per_sample = batch_community_ids.unsqueeze(1)
-        pos_proto_sim = torch.gather(torch.exp(sim_proto_matrix), 1, proto_indices_per_sample).squeeze(1)
+        comm_to_proto_idx = {cat.item(): i for i, cat in enumerate(unique_communities)}
+        proto_indices_per_sample = torch.tensor([comm_to_proto_idx[cat.item()] for cat in batch_community_ids],
+                                                device=student_feats.device)
+        pos_proto_sim = torch.gather(torch.exp(sim_proto_matrix), 1, proto_indices_per_sample.unsqueeze(1)).squeeze(
+            1)
 
         numerator = pos_instance_sim + pos_proto_sim
 
         # --- 4. 构造分母 (所有负样本) ---
         denominator = torch.exp(sim_instance_matrix).sum(dim=1) + torch.exp(sim_proto_matrix).sum(dim=1)
 
+        # w/o Prototypes
+        # numerator = pos_instance_sim
+        # denominator = torch.exp(sim_instance_matrix).sum(dim=1)
+
         # --- 5. 计算加权损失 ---
         loss = -torch.log(numerator / (denominator + 1e-8))
-        weighted_loss = (loss * sample_weights).mean()
 
-        return weighted_loss
+        return loss.mean()  # <--- 2. 直接返回损失的均值
 
     def calculate_loss(self, interaction):
         """
         计算模型的总损失（所有损失逻辑合并后的版本）。
         """
-        # 1. 前向传播，获取推荐分数并计算中间表示 (self.user_rep, self.result_embed_n1等)
+        # 1. 前向传播，获取推荐分数并计算中间表示 (self.user_rep)
         user, pos_items, neg_items = interaction
         pos_scores, neg_scores = self.forward(interaction)
 
@@ -621,55 +485,18 @@ class TT4PRO(GeneralRecommender):
         reg_loss += self.reg_weight * (self.weight_u ** 2).mean()
 
         # =================================================================
-        # 【关键修复】：提前提取当前批次的 valid items，供后续所有模块使用
+        # 模块四: 引导式解耦损失计算
         # =================================================================
+        loss_disentangle = torch.tensor(0.0).to(self.device)
         all_batch_items, _ = torch.unique(torch.cat((pos_items, neg_items)), return_inverse=True, sorted=False)
         valid_mask = (all_batch_items >= 0) & (all_batch_items < self.n_items)
         all_batch_items = all_batch_items[valid_mask]
 
-        # =================================================================
-        # 模块四: 引导式解耦损失计算
-        # =================================================================
-
-        loss_disentangle = torch.tensor(0.0, device=self.device, requires_grad=False)
-
-        if all_batch_items.shape[0] <= 1:
-            # 直接跳过解耦损失计算
-            pass
-        else:
+        if all_batch_items.shape[0] > 1:
             # a. 特征解耦
             item_image_g, item_text_g, item_image_s, item_text_s = self.mge()
             student_g_img, student_g_txt = item_image_g[all_batch_items], item_text_g[all_batch_items]
             student_s_img, student_s_txt = item_image_s[all_batch_items], item_text_s[all_batch_items]
-
-            # b. 自适应加权 (PCKD启发)
-            # =================================================================
-            # 👑 终极升级 2：多维平滑难度自适应加权 (Multi-dimensional Smooth Weighting)
-            # =================================================================
-            with torch.no_grad():
-                s_v_norm = F.normalize(student_s_img, dim=1)
-                s_t_norm = F.normalize(student_s_txt, dim=1)
-
-                # 维度 1：跨模态解耦难度 (视觉与文本的冲突程度)
-                diff_modal = 1.0 - (s_v_norm * s_t_norm).sum(dim=1)
-
-                # 维度 2：群体原型偏离难度 (距离核心语义越远，优化难度越大)
-                c_v_batch = self.global_prototypes_v[self.item_community_map[all_batch_items]]
-                c_t_batch = self.global_prototypes_t[self.item_community_map[all_batch_items]]
-                diff_proto = 2.0 - (s_v_norm * c_v_batch).sum(dim=1) - (s_t_norm * c_t_batch).sum(dim=1)
-
-                # 综合难度评分
-                difficulty_scores = diff_modal + 0.5 * diff_proto
-
-                # 【核心改良】：抛弃极端的 Softmax，改用带基线的 Min-Max 缩放。
-                # 将权重严格限制在 [0.5, 1.5] 的安全区间内！
-                # 既给困难样本施加了额外的梯度关注，又绝对不会引发数值崩溃或忽略简单样本。
-                d_min, d_max = difficulty_scores.min(), difficulty_scores.max()
-                if d_max > d_min:
-                    scaled_diff = (difficulty_scores - d_min) / (d_max - d_min + 1e-8)
-                    sample_weights = 0.5 + scaled_diff  # 映射到 [0.5, 1.5]
-                else:
-                    sample_weights = torch.ones_like(difficulty_scores)
 
             # c. 识别分级样本
             graded_samples = self._find_graded_samples(all_batch_items, item_image_g, item_text_g, item_image_s,
@@ -680,10 +507,10 @@ class TT4PRO(GeneralRecommender):
             # e. S特征分级原型对比损失
             batch_community_ids = self.item_community_map[all_batch_items]
             loss_S_visual = self._calculate_prototype_contrastive_loss(student_s_img, graded_samples,
-                                                                       batch_community_ids, sample_weights,
+                                                                       batch_community_ids,
                                                                        modality_type='visual', temp=self.infoNCETemp)
             loss_S_textual = self._calculate_prototype_contrastive_loss(student_s_txt, graded_samples,
-                                                                        batch_community_ids, sample_weights,
+                                                                        batch_community_ids,
                                                                         modality_type='textual', temp=self.infoNCETemp)
             loss_S_contrastive = loss_S_visual + loss_S_textual
 
@@ -691,12 +518,8 @@ class TT4PRO(GeneralRecommender):
             loss_graded = self.alpha_g_s * loss_InfoNCE_G + (1 - self.alpha_g_s) * loss_S_contrastive
 
             # g. CLUB 独立性损失
-            # 【核心修复】：必须对 student_g_img 加上 .detach()！
-            # 保护通用语义空间不被互信息惩罚破坏，只让特有空间 S 承担解耦的梯度压力。
-            raw_loss_club = self.item_image_estimator(student_s_img, student_g_img.detach()) + \
-                            self.item_text_estimator(student_s_txt, student_g_txt.detach())
-
-            loss_club = torch.clamp(raw_loss_club, min=0.0)
+            loss_club = self.item_image_estimator(student_s_img, student_g_img.detach()) + \
+                        self.item_text_estimator(student_s_txt, student_g_txt.detach())
 
             # h. 最终的解耦损失
             loss_disentangle = self.lambda_1 * loss_club + self.lambda_graded_align * loss_graded
@@ -720,37 +543,53 @@ class TT4PRO(GeneralRecommender):
         return score_matrix
 
     def topk_sample(self, k):
-        # 【优化】使用向量化逻辑替代低效的逐个用户循环
-        all_sampled_nodes = []
-        all_sampled_weights = []
+        """
+        (优化版) 为每个用户采样固定k个邻居及其权重。
+        - 核心逻辑: 邻居数不足时，从已有邻居中随机采样进行填充。
+        - 优化点: 代码更简洁，填充效率更高，数据类型处理更集中。
+        """
+        # 1. 初始化: 直接使用NumPy预分配内存，比Python列表更高效
+        all_sampled_neighbors = np.zeros((self.num_user, k), dtype=np.int64)
+        all_neighbor_weights = torch.zeros(self.num_user, k)
 
+        # 2. 遍历所有用户进行采样
         for user_id in range(self.num_user):
-            nodes, weights = self.user_graph_dict.get(user_id, ([], []))
-            num_neighbors = len(nodes)
+            # 安全地获取邻居信息，如果用户没有邻居，则返回空列表
+            neighbor_nodes = self.user_graph_dict.get(user_id, ([], []))[0]
+            neighbor_weights = self.user_graph_dict.get(user_id, ([], []))[1]
 
-            if num_neighbors == 0:
-                # 极端情况：无交互用户，填充 0 (【修复】：必须是 Tensor)
-                all_sampled_nodes.append(torch.zeros(k, dtype=torch.long, device=self.device))
-                all_sampled_weights.append(torch.zeros(k, dtype=torch.float, device=self.device))
+            # 3. 统一处理邻居数量不足和过多的情况
+            if len(neighbor_nodes) == 0:
+                # 情况一：没有任何邻居，直接跳过，保留为0
                 continue
 
-            nodes_tensor = torch.tensor(nodes, device=self.device)
-            weights_tensor = torch.tensor(weights, device=self.device)
-
-            if num_neighbors >= k:
-                sampled_nodes = nodes_tensor[:k]
-                sampled_weights = weights_tensor[:k]
+            if len(neighbor_nodes) >= k:
+                # 情况二：邻居数量充足，直接截取前k个
+                sampled_nodes = neighbor_nodes[:k]
+                sampled_weights = torch.tensor(neighbor_weights[:k])
             else:
-                # 邻居不足，利用 multinomial 或者 randint 进行带放回填充
-                pad_indices = torch.randint(0, num_neighbors, (k - num_neighbors,), device=self.device)
-                sampled_nodes = torch.cat([nodes_tensor, nodes_tensor[pad_indices]])
-                sampled_weights = torch.cat([weights_tensor, weights_tensor[pad_indices]])
+                # 情况三：邻居数量不足，需要填充
+                original_nodes = neighbor_nodes
+                original_weights = torch.tensor(neighbor_weights)
 
-            all_sampled_nodes.append(sampled_nodes)
-            all_sampled_weights.append(sampled_weights)
+                # 计算需要填充的数量
+                num_to_pad = k - len(original_nodes)
 
-        # 堆叠为矩阵并一次性在 GPU 上计算 softmax
-        nodes_matrix = torch.stack(all_sampled_nodes)
-        weights_matrix = F.softmax(torch.stack(all_sampled_weights), dim=1)
+                # 使用np.random.choice一次性高效地生成填充内容
+                # replace=True表示可以重复采样
+                padding_indices = np.random.choice(len(original_nodes), size=num_to_pad, replace=True)
 
-        return nodes_matrix.cpu().tolist(), weights_matrix
+                # 将原始邻居和填充邻居合并
+                padded_nodes = [original_nodes[i] for i in padding_indices]
+                padded_weights = original_weights[padding_indices]
+
+                sampled_nodes = original_nodes + padded_nodes
+                sampled_weights = torch.cat([original_weights, padded_weights])
+
+            # 4. 将处理好的数据存入预分配的数组和张量中
+            all_sampled_neighbors[user_id] = np.array(sampled_nodes)
+            all_neighbor_weights[user_id] = F.softmax(sampled_weights, dim=0)  # 直接计算softmax
+
+        # 5. 返回最终结果
+        # all_sampled_neighbors可以直接使用，或者如果后续需要tensor，则转换为torch.tensor
+        return all_sampled_neighbors.tolist(), all_neighbor_weights

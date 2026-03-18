@@ -1,33 +1,30 @@
 import torch
-import igraph as ig                      # <--- 新增
-import leidenalg as la                   # <--- 新增
+import igraph as ig
+import leidenalg as la
 import os
 import scipy.sparse as sp
 import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-from sklearn.metrics.pairwise import cosine_similarity
-
-# --- 导入您的 Dataset 类 ---
-from dataset import RecDataset
-
-# --- ↓↓↓ 添加下面的代码块 ↓↓↓ ---
+from sklearn.preprocessing import RobustScaler  # <-- 优化1: 改成更鲁棒的 scaler
+from sklearn.metrics import silhouette_score   # <-- 优化4: 新增量化评估
+from collections import Counter
 import random
 
-# 设置一个全局随机种子以保证所有操作的可复现性
+from utils.dataset import RecDataset
+
+# --- 全局可复现种子 ---
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
-# --- ↑↑↑ 添加结束 ↑↑↑ ---
 
 # --- 配置 ---
 config = {
     'dataset': 'baby',
-    'data_path': '/root/autodl-tmp/code/TT2/data/',
-    # 'data_path': '/home/ljy/Documents/nwu/science/code/TT2/data/',
+    'data_path': '/openbayes/input/input0/',
     'USER_ID_FIELD': 'userID',
     'ITEM_ID_FIELD': 'itemID',
     'inter_splitting_label': 'x_label',
@@ -38,154 +35,270 @@ config = {
 dataset_name = config['dataset']
 dataset_path = os.path.join(config['data_path'], dataset_name)
 
-# --- 超参数 ---
-# 第一阶段参数
+# --- 超参数（已优化）---
 content_knn_k = 10
 collab_knn_k = 10
+alpha = 0.4                    # <-- 优化2: collab 权重提升到 0.4
+resolution_parameter = 0.8     # <-- 优化2: 减少碎社区
+min_sub_clusters = 5
+max_sub_clusters = 50
 
-# =================================================================================
-# ====== 主要修改部分 START =========================================================
-# =================================================================================
-# 第二阶段参数：不再使用固定的k，而是定义一个范围
-min_sub_clusters = 5  # 每个宏观社区最少聚成5个子类
-max_sub_clusters = 50  # 每个宏观社区最多聚成50个子类
-# =================================================================================
-# ====== 主要修改部分 END ===========================================================
-
-# 路径
+# --- 路径 ---
 output_file = os.path.join(dataset_path, 'item_to_hierarchical_community.pt')
+macro_file = os.path.join(dataset_path, 'macro_community.pt')  # <-- 新增中间结果
 mm_adj_path = os.path.join(dataset_path, f'mm_adj_{content_knn_k}.pt')
 text_feat_path = os.path.join(dataset_path, 'text_feat.npy')
-
-# =================================================================================
-# ====== 阶段一：使用Louvain发现宏观社区 START ===================================
-# =================================================================================
-print("--- 阶段一：开始发现宏观社区 ---")
-# 1. 加载数据和交互矩阵
-dataset = RecDataset(config)
-n_users, n_items = dataset.user_num, dataset.item_num
-rows = dataset.df[config['USER_ID_FIELD']].values
-cols = dataset.df[config['ITEM_ID_FIELD']].values
-interaction_matrix = sp.csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n_users, n_items))
-
-# 3. 加载内容图
-A_content_sparse = torch.load(mm_adj_path).cpu().coalesce()
-A_content_indices = A_content_sparse.indices().numpy()
-A_content_values = A_content_sparse.values().numpy()
-A_content = sp.coo_matrix((A_content_values, (A_content_indices[0], A_content_indices[1])), shape=(n_items, n_items))
-A_fused = A_content
-A_fused = A_fused.tocoo()
-
-# 4. Leiden社区发现 (新版本)
-print("在融合图上执行Leiden社区发现...")
-# Leiden算法使用 igraph 对象，而不是 networkx
-# 从边列表直接创建 igraph 图
-edges = list(zip(A_fused.row, A_fused.col))
-# 【核心修复】：必须传入 n=n_items，强制图的节点数与全局真实商品数一致，避免孤立节点导致索引错乱！
-G_ig = ig.Graph(n=n_items, edges=edges, directed=False)
-
-# 执行Leiden算法
-# find_partition 返回一个划分对象
-# --- ↓↓↓ 修改这一行 ↓↓↓ ---
-# 原代码:
-# partition_ig = la.find_partition(G_ig, la.ModularityVertexPartition)
-# 修改后:
-partition_ig = la.find_partition(G_ig, la.ModularityVertexPartition, seed=SEED)
-# --- ↑↑↑ 修改结束 ↑↑↑ ---
-
-# 将结果转换为与Louvain输出兼容的 {节点: 社区ID} 字典格式
-partition = {node.index: membership for node, membership in zip(G_ig.vs, partition_ig.membership)}
-
-num_macro_communities = len(set(partition.values()))
-print(f"阶段一完成！发现 {num_macro_communities} 个宏观社区。")
-# =================================================================================
-# ====== 阶段一 END ===============================================================
-# =================================================================================
-
-# =================================================================================
-# ====== 阶段二：进行自适应的K-Means细分 START ========================
-# =================================================================================
-print("\n--- 阶段二：开始在宏观社区内进行自适应K-Means细分 ---")
-# 1. 加载用于K-Means的文本特征
-# 【核心修复】：加载视觉与文本双模态特征，并进行 L2 归一化拼接，实现真正的多模态细分
-text_features = np.load(text_feat_path)
 image_feat_path = os.path.join(dataset_path, 'image_feat.npy')
 
+print("=== 优化版层级社区发现开始 ===")
+
+# =================================================================================
+# ====== 阶段一：Leiden 宏观社区（融合协同+内容 + 量化评估） ========================
+# =================================================================================
+print("阶段一：构建融合图 & Leiden 宏观社区...")
+dataset = RecDataset(config)
+n_users, n_items = dataset.user_num, dataset.item_num
+interaction_matrix = sp.csr_matrix(
+    (np.ones(len(dataset.df)),
+     (dataset.df[config['USER_ID_FIELD']].values,
+      dataset.df[config['ITEM_ID_FIELD']].values)),
+    shape=(n_users, n_items))
+
+# 协同图（导师建议5）
+A_collab = interaction_matrix.T @ interaction_matrix
+A_collab.setdiag(0)
+A_collab.eliminate_zeros()
+collab_row_sum = np.array(A_collab.sum(axis=1)).flatten()
+collab_row_sum[collab_row_sum == 0] = 1.0
+A_collab = A_collab.multiply(1.0 / collab_row_sum[:, np.newaxis])
+
+# 内容图 + 行归一化（优化1）
+A_content_sparse = torch.load(mm_adj_path).cpu().coalesce()
+A_content = sp.coo_matrix(
+    (A_content_sparse.values().numpy(),
+     (A_content_sparse.indices()[0].numpy(), A_content_sparse.indices()[1].numpy())),
+    shape=(n_items, n_items))
+content_row_sum = np.array(A_content.sum(axis=1)).flatten()
+content_row_sum[content_row_sum == 0] = 1.0
+A_content = A_content.multiply(1.0 / content_row_sum[:, np.newaxis])
+
+# 融合（优化2）
+A_fused = (1 - alpha) * A_content + alpha * A_collab
+A_fused = A_fused.tocoo()
+
+# Leiden
+G_ig = ig.Graph(n=n_items, edges=list(zip(A_fused.row, A_fused.col)), directed=False)
+partition_ig = la.find_partition(
+    G_ig, la.RBConfigurationVertexPartition,
+    weights=A_fused.data.tolist(),
+    resolution_parameter=resolution_parameter,
+    seed=SEED
+)
+partition = {v.index: m for v, m in zip(G_ig.vs, partition_ig.membership)}
+num_macro = len(set(partition.values()))
+
+# === 新增量化评估（优化4）===
+modularity = partition_ig.modularity
+macro_sizes = sorted(Counter(partition.values()).values())
+print(f"阶段一完成！发现 {num_macro} 个宏观社区")
+print(f"Modularity（越高越好）: {modularity:.4f}")
+print(f"宏社区大小统计: min={min(macro_sizes)}, max={max(macro_sizes)}, avg={np.mean(macro_sizes):.1f}")
+
+# =================================================================================
+# ====== 阶段二：自适应 K-Means 子社区（RobustScaler + elbow+silhouette） ============
+# =================================================================================
+print("\n阶段二：宏观社区内自适应细分...")
+text_features = np.load(text_feat_path)
 if os.path.exists(image_feat_path):
     image_features = np.load(image_feat_path)
-    # 归一化以防止某一模态的绝对数值过大而主导 K-Means 距离
     text_features = text_features / (np.linalg.norm(text_features, axis=1, keepdims=True) + 1e-8)
     image_features = image_features / (np.linalg.norm(image_features, axis=1, keepdims=True) + 1e-8)
     fused_features = np.concatenate([text_features, image_features], axis=1)
 else:
-    print("警告：未找到 image_feat.npy，模型将退化为仅依赖文本的聚类！")
     fused_features = text_features
 
-# 2. 将物品按宏观社区分组
 communities = {}
-for item_id, community_id in partition.items():
-    if community_id not in communities:
-        communities[community_id] = []
-    communities[community_id].append(item_id)
+for item_id, cid in partition.items():
+    communities.setdefault(cid, []).append(item_id)
 
-# 3. 准备最终的层级化社区标签
 item_hierarchical_community_map = torch.zeros(n_items, dtype=torch.long)
 total_clusters = 0
+sil_scores = []  # <-- 新增量化评估
 
-# 4. 遍历每个宏观社区，进行内部聚类
 for macro_id, items_in_macro in communities.items():
-    num_items_in_macro = len(items_in_macro)
-
-    # --- 核心自适应逻辑 ---
-    # 根据平方根法则动态计算k值
-    dynamic_k = int(np.sqrt(num_items_in_macro))
-    # 将k值限制在预设的最小和最大范围内
-    k_for_this_community = max(min_sub_clusters, min(dynamic_k, max_sub_clusters))
-
-    print(f"正在处理宏观社区 {macro_id} (含 {num_items_in_macro} 物品)，动态设定 K = {k_for_this_community}...")
-
-    # 如果社区内物品太少，则不进行细分
-    if num_items_in_macro < k_for_this_community:
+    n = len(items_in_macro)
+    if n < min_sub_clusters:
         for item_id in items_in_macro:
             item_hierarchical_community_map[item_id] = total_clusters
         total_clusters += 1
         continue
 
-    # 【核心修复】：提取融合后的双模态特征
-    community_features = fused_features[items_in_macro]
+    # 特征预处理（优化1）
+    feats = fused_features[items_in_macro]
+    feats = RobustScaler().fit_transform(feats)   # <-- 改成 RobustScaler
 
-    # 【核心修复】：调整 PCA 逻辑，目标维度必须远小于样本数，避免 K-Means 维度灾难失效
-    if community_features.shape[1] > 32 and num_items_in_macro > 50:
-        # 动态决定维度：最大32维，且不超过当前簇样本数的 1/3
-        target_dims = min(32, num_items_in_macro // 3)
-        pca = PCA(n_components=target_dims, random_state=SEED)
-        community_features = pca.fit_transform(community_features)
+    # PCA（保留 85% 方差）
+    if feats.shape[1] > 32 and n > 50:
+        pca = PCA(n_components=0.85, random_state=SEED)
+        feats = pca.fit_transform(feats)
 
-    # 使用动态计算的k值进行K-Means聚类
-    # --- ↓↓↓ 修改这一行 ↓↓↓ ---
-    # 原代码:
-    # kmeans = KMeans(n_clusters=k_for_this_community, random_state=42, n_init='auto')
-    # 修改后:
-    kmeans = KMeans(n_clusters=k_for_this_community, random_state=SEED, n_init='auto')
-    # --- ↑↑↑ 修改结束 ↑↑↑ ---
-    sub_labels = kmeans.fit_predict(community_features)
+    # 自适应 K（优化3）
+    k_cand = list(range(max(2, min_sub_clusters), min(max_sub_clusters + 1, n)))
+    if len(k_cand) <= 2:
+        best_k = k_cand[0]
+    else:
+        # 肘部法
+        inertias = [KMeans(n_clusters=k, random_state=SEED, n_init=20, init='k-means++').fit(feats).inertia_
+                    for k in k_cand]
+        p1, p2 = np.array([k_cand[0], inertias[0]]), np.array([k_cand[-1], inertias[-1]])
+        dists = [np.abs(np.cross(p2 - p1, np.array([k_cand[i], inertias[i]]) - p1)) / np.linalg.norm(p2 - p1)
+                 for i in range(len(inertias))]
+        elbow_k = k_cand[np.argmax(dists)]
 
-    # 创建全局唯一的层级化标签
+        # silhouette 精炼（优化3：鲁棒性提升）
+        best_k, best_sil = elbow_k, -1
+        for dk in [-1, 0, 1]:
+            kk = elbow_k + dk
+            if kk < 2 or kk > n: continue
+            km = KMeans(n_clusters=kk, random_state=SEED, n_init=20, init='k-means++').fit(feats)
+            labels = km.labels_
+            if len(set(labels)) > 1:
+                sil = silhouette_score(feats, labels)
+                if sil > best_sil:
+                    best_sil, best_k = sil, kk
+        if best_sil > 0:
+            sil_scores.append(best_sil)
+
+    # 最终聚类
+    kmeans = KMeans(n_clusters=best_k, random_state=SEED, n_init=20, init='k-means++')
+    sub_labels = kmeans.fit_predict(feats)
     for i, item_id in enumerate(items_in_macro):
-        hierarchical_label = total_clusters + sub_labels[i]
-        item_hierarchical_community_map[item_id] = hierarchical_label
+        item_hierarchical_community_map[item_id] = total_clusters + sub_labels[i]
+    total_clusters += best_k
 
-    # 更新全局总簇数
-    total_clusters += k_for_this_community
-
-print("阶段二完成！")
 # =================================================================================
-# ====== 阶段二 END ===============================================================
+# ====== 保存 & 最终评估（优化4） =================================================
 # =================================================================================
-
-# --- 保存最终结果 ---
 torch.save(item_hierarchical_community_map, output_file)
+torch.save(torch.tensor([partition.get(i, 0) for i in range(n_items)]), macro_file)
 
-print(f"\n物品到【层级化社区】的映射已保存到: {output_file}")
-print("发现的最终社区总数:", total_clusters)
-print("张量预览:", item_hierarchical_community_map[:20])
+print(f"\n=== 优化完成！===")
+print(f"最终子社区总数: {total_clusters}")
+print(f"平均 silhouette 分数: {np.mean(sil_scores):.4f}（越高越好）")
+print(f"层级映射已保存: {output_file}")
+print(f"宏观分区已保存: {macro_file}")
+print(f"张量预览: {item_hierarchical_community_map[:20]}")
+
+# 子社区大小统计（方便继续调参）
+sub_sizes = np.bincount(item_hierarchical_community_map.numpy())
+print(f"子社区大小统计: min={sub_sizes.min()}, max={sub_sizes.max()}, avg={sub_sizes.mean():.1f}")
+
+# =================================================================================
+# ====== 修复版后处理：同宏观内合并 + 全局ID重映射（解决两大隐患） ================
+# =================================================================================
+print("\n后处理：【同宏观内】合并 size <= 2 的孤立子社区（保留层级边界）...")
+
+from collections import defaultdict
+
+MIN_CLUSTER_SIZE = 3          # ← 可调：想更严格就改成 4
+small_threshold = MIN_CLUSTER_SIZE - 1
+
+# 1. 预计算所有子社区中心（全局一次）
+cluster_centers = {}
+for cid in range(total_clusters):
+    mask = (item_hierarchical_community_map == cid)
+    if mask.sum() > 0:
+        cluster_centers[cid] = fused_features[mask.numpy()].mean(axis=0)
+
+# 2. 按宏观社区分组当前子社区（关键！限制合并范围）
+macro_to_subs = defaultdict(set)
+for item_id in range(n_items):
+    macro_id = partition.get(item_id, 0)          # 使用阶段一的 Leiden 宏观ID
+    sub_id = item_hierarchical_community_map[item_id].item()
+    macro_to_subs[macro_id].add(sub_id)
+
+reassigned = 0
+merged_log = []
+
+for macro_id, sub_ids_in_macro in macro_to_subs.items():
+    small_subs = [s for s in sub_ids_in_macro if sub_sizes[s] <= small_threshold]
+    if not small_subs:
+        continue
+
+    healthy_subs = [s for s in sub_ids_in_macro if sub_sizes[s] >= MIN_CLUSTER_SIZE]
+
+    if healthy_subs:
+        # 正常情况：有健康簇 → 把小簇合并到最近的健康簇
+        for small_cid in small_subs:
+            items_in_small = torch.where(item_hierarchical_community_map == small_cid)[0].numpy()
+            if len(items_in_small) == 0:
+                continue
+
+            small_center = fused_features[items_in_small].mean(axis=0) if len(items_in_small) > 1 \
+                           else fused_features[items_in_small[0]]
+
+            distances = {}
+            for h_cid in healthy_subs:
+                if h_cid == small_cid:
+                    continue
+                dist = np.linalg.norm(small_center - cluster_centers[h_cid])
+                distances[h_cid] = dist
+
+            if not distances:
+                continue
+
+            nearest_cid = min(distances, key=distances.get)
+
+            for item_idx in items_in_small:
+                item_hierarchical_community_map[item_idx] = nearest_cid
+            reassigned += len(items_in_small)
+
+            sub_sizes[small_cid] = 0
+            sub_sizes[nearest_cid] += len(items_in_small)
+
+            merged_log.append(f"宏观 {macro_id}：子簇 {small_cid}(size={len(items_in_small)}) → {nearest_cid}")
+
+    else:
+        # 极端情况：没有健康簇，全是小簇
+        if len(small_subs) == 1:
+            merged_log.append(f"宏观 {macro_id} 只有一个子簇（size={sub_sizes[small_subs[0]]}），保留")
+        else:
+            target_cid = small_subs[0]
+            total_items_merged = 0
+
+            for small_cid in small_subs[1:]:
+                items_in_small = torch.where(item_hierarchical_community_map == small_cid)[0].numpy()
+                if len(items_in_small) == 0:
+                    continue
+                for item_idx in items_in_small:
+                    item_hierarchical_community_map[item_idx] = target_cid
+                total_items_merged += len(items_in_small)
+                sub_sizes[small_cid] = 0
+                sub_sizes[target_cid] += len(items_in_small)
+
+            merged_log.append(
+                f"宏观 {macro_id} 全是小簇（共 {len(small_subs)} 个），已强制合并到子簇 {target_cid}，"
+                f"新增 {total_items_merged} 个物品"
+            )
+
+print(f"合并完成！共重新分配 {reassigned} 个物品")
+if merged_log:
+    print("合并详情（前5条）：")
+    for line in merged_log[:5]:
+        print("  ", line)
+    if len(merged_log) > 5:
+        print(f"  ... 共 {len(merged_log)} 个合并操作")
+
+# 3. 全局重映射：消除 ID 断层（工程安全）
+final_labels_np = item_hierarchical_community_map.numpy()
+unique_coms = np.sort(np.unique(final_labels_np))
+remap_dict = {old: new for new, old in enumerate(unique_coms)}
+
+item_hierarchical_community_map = torch.tensor([remap_dict[l] for l in final_labels_np], dtype=torch.long)
+
+new_total_clusters = len(unique_coms)
+print(f"后处理后有效子社区数量: {new_total_clusters}（ID 已连续 0~{new_total_clusters-1}）")
+
+# 更新大小统计
+sub_sizes = np.bincount(item_hierarchical_community_map.numpy())
+print(f"最终子社区大小统计: min={sub_sizes.min()}（已无 size=1/2）, max={sub_sizes.max()}, avg={sub_sizes.mean():.1f}")

@@ -23,6 +23,8 @@ from utils.topk_evaluator import TopKEvaluator
 import seaborn as sns
 from sklearn.manifold import TSNE
 
+import torch.nn.functional as F
+
 
 class AbstractTrainer(object):
     r"""Trainer Class is used to manage the training and evaluation processes of recommender system models.
@@ -363,162 +365,90 @@ class Trainer(AbstractTrainer):
 
     def _generate_tsne_visualization(self, epoch_idx):
         """
-        生成 t-SNE 可视化图，使用两种颜色区分文本模态和图像模态
+        基于模型训练后特征 (Specific Space) 与真实聚类标签的 t-SNE 与质量评估
         """
-        if not self.tsne_enabled:
+        if not self.tsne_enabled or epoch_idx % self.tsne_interval != 0:
             return
 
-        # 每隔指定的epoch才生成t-SNE图
-        if epoch_idx % self.tsne_interval != 0:
-            return
-
-        self.logger.info(f'Generating t-SNE visualization for epoch {epoch_idx}...')
+        self.logger.info(f'Generating t-SNE visualization for Specific Space (Epoch {epoch_idx})...')
 
         try:
-            # 将模型设置为评估模式
             self.model.eval()
-
-            # 获取模型的物品嵌入
             with torch.no_grad():
-                # 检查模型是否有必要的属性
-                if hasattr(self.model, 'result_embed'):
-                    all_embeddings = self.model.result_embed
-                    n_users = self.model.n_users if hasattr(self.model, 'n_users') else 0
+                # 【导师建议1】：使用模型前向传播后的解耦特征 (Specific Space) 评估聚类
+                if not hasattr(self.model, 'mge'):
+                    return
+                _, _, item_image_s, item_text_s = self.model.mge()
 
-                    # 提取物品嵌入
-                    item_embeddings = all_embeddings[n_users:]
+                # 融合视觉和文本特征代表该物品的整体特有特征 (或者任选其一)
+                item_image_s = F.normalize(item_image_s, p=2, dim=-1)
+                item_text_s = F.normalize(item_text_s, p=2, dim=-1)
+                s_feat = (item_image_s + item_text_s) / 2.0
 
-                    # 采样物品
-                    n_items = item_embeddings.shape[0]
-                    sample_size = min(self.tsne_sample_size, n_items)
-                    indices = np.random.choice(n_items, sample_size, replace=False)
 
-                    sampled_embeddings = item_embeddings[indices].cpu().numpy()
+                n_items = s_feat.shape[0]
+                sample_size = min(self.tsne_sample_size, n_items)
 
-                    # 创建模态标签 - 根据模型是否有视觉和文本特征来区分
-                    modality_labels = []
-                    visual_indices = []
-                    textual_indices = []
+                # 采样
+                np.random.seed(42)
+                indices = np.random.choice(n_items, sample_size, replace=False)
+                sampled_embeddings = s_feat[indices].cpu().numpy()
 
-                    # 检查模型是否有视觉特征和文本特征
-                    has_visual = hasattr(self.model, 'v_feat') and self.model.v_feat is not None
-                    has_textual = hasattr(self.model, 't_feat') and self.model.t_feat is not None
-
-                    if has_visual and has_textual:
-                        # 如果同时有视觉和文本特征，可以按某种方式区分
-                        # 这里简单地将前半部分标记为视觉，后半部分标记为文本
-                        mid_point = sample_size // 2
-                        modality_labels = ['Visual'] * mid_point + ['Textual'] * (sample_size - mid_point)
-                        visual_indices = list(range(mid_point))
-                        textual_indices = list(range(mid_point, sample_size))
-                    elif has_visual:
-                        # 只有视觉特征
-                        modality_labels = ['Visual'] * sample_size
-                        visual_indices = list(range(sample_size))
-                    elif has_textual:
-                        # 只有文本特征
-                        modality_labels = ['Textual'] * sample_size
-                        textual_indices = list(range(sample_size))
-                    else:
-                        # 默认情况，简单分为两半
-                        mid_point = sample_size // 2
-                        modality_labels = ['Visual'] * mid_point + ['Textual'] * (sample_size - mid_point)
-                        visual_indices = list(range(mid_point))
-                        textual_indices = list(range(mid_point, sample_size))
-
-                    # 计算视觉模态内部的平均距离
-                    dist_v = 0.0
-                    if len(visual_indices) > 1:  # 需要至少两个点才能计算距离
-                        visual_embeddings = sampled_embeddings[visual_indices]
-                        distances_v = []
-                        for i in range(len(visual_embeddings)):
-                            for j in range(i + 1, len(visual_embeddings)):
-                                distance = np.linalg.norm(visual_embeddings[i] - visual_embeddings[j])
-                                distances_v.append(distance)
-                        dist_v = np.mean(distances_v) if distances_v else 0.0
-
-                    # 计算文本模态内部的平均距离
-                    dist_t = 0.0
-                    if len(textual_indices) > 1:  # 需要至少两个点才能计算距离
-                        textual_embeddings = sampled_embeddings[textual_indices]
-                        distances_t = []
-                        for i in range(len(textual_embeddings)):
-                            for j in range(i + 1, len(textual_embeddings)):
-                                distance = np.linalg.norm(textual_embeddings[i] - textual_embeddings[j])
-                                distances_t.append(distance)
-                        dist_t = np.mean(distances_t) if distances_t else 0.0
-
-                    # 计算聚类质量评估指标
-                    silhouette_score_val = 0.0
-                    calinski_harabasz_score_val = 0.0
-                    davies_bouldin_score_val = 0.0
-
-                    try:
-                        from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
-
-                        # 确保有足够的样本和类别来计算指标
-                        unique_labels = list(set(modality_labels))
-                        if len(unique_labels) > 1 and sample_size >= 2:
-                            # 轮廓系数 (Silhouette Score)
-                            label_numbers = [0 if label == 'Visual' else 1 for label in modality_labels]
-                            silhouette_score_val = silhouette_score(sampled_embeddings, label_numbers)
-
-                            # Calinski-Harabasz 指数
-                            calinski_harabasz_score_val = calinski_harabasz_score(sampled_embeddings, label_numbers)
-
-                            # Davies-Bouldin 指数
-                            davies_bouldin_score_val = davies_bouldin_score(sampled_embeddings, label_numbers)
-                    except Exception as e:
-                        self.logger.warning(f"Error calculating clustering metrics: {e}")
-
-                    # 执行 t-SNE
-                    tsne = TSNE(n_components=2, perplexity=self.tsne_perplexity, random_state=42, max_iter=1000)
-                    embeddings_2d = tsne.fit_transform(sampled_embeddings)
-
-                    # 生成并保存图像
-                    plt.figure(figsize=(12, 10))
-                    sns.set_style("whitegrid")
-
-                    # 使用两种颜色区分模态
-                    palette = {"Visual": "blue", "Textual": "red"}
-                    plot = sns.scatterplot(
-                        x=embeddings_2d[:, 0],
-                        y=embeddings_2d[:, 1],
-                        hue=modality_labels,
-                        palette=palette,
-                        legend='full', alpha=0.8, s=50
-                    )
-
-                    plt.title(
-                        f't-SNE Visualization of Item Embeddings (Epoch {epoch_idx})\n'
-                        f'Dist_V: {dist_v:.4f}, Dist_T: {dist_t:.4f}\n'
-                        f'Silhouette: {silhouette_score_val:.4f}, CH: {calinski_harabasz_score_val:.2f}, DB: {davies_bouldin_score_val:.4f}',
-                        fontsize=14)
-                    plt.xlabel('t-SNE Dimension 1', fontsize=12)
-                    plt.ylabel('t-SNE Dimension 2', fontsize=12)
-                    plt.tight_layout()
-
-                    # 保存图像，文件名包含所有评估指标信息
-                    save_dir = os.path.join(
-                        self.config['checkpoint_dir'],
-                        self.config['model'],
-                        f'tsne_epoch_{epoch_idx}_dist_v_{dist_v:.4f}_dist_t_{dist_t:.4f}_'
-                        f'sil_{silhouette_score_val:.4f}_ch_{calinski_harabasz_score_val:.2f}_db_{davies_bouldin_score_val:.4f}'
-                    )
-                    os.makedirs(save_dir, exist_ok=True)
-                    filename = f"tsne_visualization.png"
-                    filepath = os.path.join(save_dir, filename)
-                    plt.savefig(filepath, dpi=300, bbox_inches='tight')
-                    plt.close()
-
-                    self.logger.info(f't-SNE visualization saved to {filepath}')
-                    self.logger.info(f'Visual modality average distance (dist_v): {dist_v:.4f}')
-                    self.logger.info(f'Textual modality average distance (dist_t): {dist_t:.4f}')
-                    self.logger.info(f'Silhouette Score: {silhouette_score_val:.4f}')
-                    self.logger.info(f'Calinski-Harabasz Score: {calinski_harabasz_score_val:.2f}')
-                    self.logger.info(f'Davies-Bouldin Score: {davies_bouldin_score_val:.4f}')
+                # 【导师建议2】：使用真正的聚类标签 (层级化社区ID) 进行评估！
+                if hasattr(self.model, 'item_community_map'):
+                    true_labels = self.model.item_community_map[indices].cpu().numpy()
                 else:
-                    self.logger.warning("Model does not have result_embed attribute, skipping t-SNE visualization")
+                    self.logger.warning("No item_community_map found. Skip clustering evaluation.")
+                    return
+
+                # ==========================================
+                # 计算科研级聚类指标 (Silhouette, CH, DB)
+                # ==========================================
+                silhouette_score_val = 0.0
+                calinski_harabasz_score_val = 0.0
+                davies_bouldin_score_val = 0.0
+
+                from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
+                unique_labels = len(np.unique(true_labels))
+                if 1 < unique_labels < sample_size:
+                    silhouette_score_val = silhouette_score(sampled_embeddings, true_labels)
+                    calinski_harabasz_score_val = calinski_harabasz_score(sampled_embeddings, true_labels)
+                    davies_bouldin_score_val = davies_bouldin_score(sampled_embeddings, true_labels)
+
+                # ==========================================
+                # 执行 t-SNE 降维
+                # ==========================================
+                tsne = TSNE(n_components=2, perplexity=self.tsne_perplexity, init='pca', random_state=42)
+                embeddings_2d = tsne.fit_transform(sampled_embeddings)
+
+                # ==========================================
+                # 绘制图表：颜色代表真实的社区 ID
+                # ==========================================
+                plt.figure(figsize=(12, 10))
+                sns.set_style("white")
+
+                # 由于社区可能很多，我们画出散点并用颜色映射社区
+                scatter = plt.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1],
+                                      c=true_labels, cmap='tab20', alpha=0.8, s=40, edgecolors='w')
+
+                plt.title(f'Semantic Clustering in Specific Space (Epoch {epoch_idx})\n'
+                          f'Silhouette: {silhouette_score_val:.4f} | CH: {calinski_harabasz_score_val:.1f} | DB: {davies_bouldin_score_val:.4f}',
+                          fontsize=14, fontweight='bold')
+                plt.xticks([]);
+                plt.yticks([])
+                plt.tight_layout()
+
+                # 保存
+                save_dir = os.path.join(self.config['checkpoint_dir'], self.config['model'], 'tsne_clustering')
+                os.makedirs(save_dir, exist_ok=True)
+                filepath = os.path.join(save_dir, f"tsne_epoch_{epoch_idx}_sil_{silhouette_score_val:.4f}.png")
+
+                plt.savefig(filepath, dpi=300, bbox_inches='tight')
+                plt.close()
+
+                self.logger.info(f't-SNE saved to {filepath}')
+                self.logger.info(f'[Clustering] Silhouette Score: {silhouette_score_val:.4f} (Higher is better)')
+                self.logger.info(f'[Clustering] Davies-Bouldin: {davies_bouldin_score_val:.4f} (Lower is better)')
 
         except Exception as e:
             self.logger.error(f"Error generating t-SNE visualization: {e}")
