@@ -48,25 +48,7 @@ class TT6PRO(GeneralRecommender):
 
         dataset_path = os.path.abspath(config['data_path'] + config['dataset'])
 
-        # --- 核心改动: 加载图社区标签 ---
-        # 提示: 'item_to_community.pt' 是您通过图社区发现脚本生成的
-        # K-Means
-        # community_map_path = os.path.join(dataset_path, 'item_to_cluster.pt ')
-        community_map_path = os.path.join(dataset_path, 'item_to_hierarchical_community.pt')
-        if os.path.exists(community_map_path):
-            item_community_map = torch.load(community_map_path).long()
-            self.register_buffer('item_community_map', item_community_map)
-        else:
-            # 如果文件不存在，创建一个随机的作为占位符，并打印警告
-            print("警告: 'item_to_community.pt' 文件未找到。将使用随机社区标签。请运行预处理脚本生成该文件。")
-            item_community_map = torch.randint(0, 100, (self.n_items,)).long()
-            self.register_buffer('item_community_map', item_community_map)
-        # --- 改动结束 ---
-
-        self.user_graph_dict = np.load(os.path.join(dataset_path, config['user_graph_dict_file']),
-                                       allow_pickle=True).item()
-        mm_adj_file = os.path.join(dataset_path, 'mm_adj_{}.pt'.format(self.knn_k))
-
+        # 1. 必须先准备好 mm_adj (邻接矩阵)，因为社区脚本 process_hierarchical_community_pro.py 依赖它
         if self.v_feat is not None:
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
             self.image_trs = nn.Linear(self.v_feat.shape[1], self.feat_embed_dim)
@@ -77,9 +59,11 @@ class TT6PRO(GeneralRecommender):
         nn.init.xavier_uniform_(self.image_trs.weight) if self.v_feat is not None else None
         nn.init.xavier_uniform_(self.text_trs.weight) if self.t_feat is not None else None
 
+        mm_adj_file = os.path.join(dataset_path, 'mm_adj_{}.pt'.format(self.knn_k))
         if os.path.exists(mm_adj_file):
             self.mm_adj = torch.load(mm_adj_file)
         else:
+            # 如果矩阵不存在，现场计算并保存，解决版本不兼容报错问题
             if self.v_feat is not None:
                 indices, image_adj = self.get_knn_adj_mat(self.image_embedding.weight.detach())
                 self.mm_adj = image_adj
@@ -88,9 +72,33 @@ class TT6PRO(GeneralRecommender):
                 self.mm_adj = text_adj
             if self.v_feat is not None and self.t_feat is not None:
                 self.mm_adj = self.mm_image_weight * image_adj + (1.0 - self.mm_image_weight) * text_adj
-                del text_adj
+                del text_adj;
                 del image_adj
             torch.save(self.mm_adj, mm_adj_file)
+
+        # 2. 自动检查社区文件，不存在则调用脚本生成
+        community_map_path = os.path.join(dataset_path, 'item_to_hierarchical_community.pt')
+        if not os.path.exists(community_map_path):
+            import subprocess
+            import sys
+            print(f"\n[自动构建] 正在生成 {config['dataset']} 的社区标签...\n")
+            try:
+                # 确保使用当前环境的 python 运行脚本
+                subprocess.run([sys.executable, "process_hierarchical_community_pro.py", "-d", config['dataset'],
+                                "-p", config['data_path']],
+                               check=True)
+            except Exception as e:
+                print(f"[自动构建] 失败: {e}")
+
+        # 3. 加载生成的社区文件
+        if os.path.exists(community_map_path):
+            self.register_buffer('item_community_map', torch.load(community_map_path).long())
+        else:
+            self.register_buffer('item_community_map', torch.randint(0, 100, (self.n_items,)).long())
+
+        # 4. 加载用户图（保留原逻辑）
+        self.user_graph_dict = np.load(os.path.join(dataset_path, config['user_graph_dict_file']),
+                                       allow_pickle=True).item()
 
         # packing interaction in training into edge_index
         train_interactions = dataset.inter_matrix(form='coo').astype(np.float32)
