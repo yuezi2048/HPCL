@@ -119,11 +119,10 @@ omegaconf.log
 
 
 ### custom ###
-./.idea
-./创新点文字
-./saved
-./log
-./visual/output
+./.idea/
+./创新点文字/
+./saved/
+./log/
 ./python
 /.pip
-./envs
+./envs/
