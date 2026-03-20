@@ -47,9 +47,9 @@ config['inter_file_name'] = f'{dataset_name}.inter'
 content_knn_k = 10
 collab_knn_k = 10
 alpha = 0.4                    # <-- 优化2: collab 权重提升到 0.4
-resolution_parameter = 0.8     # <-- 优化2: 减少碎社区
+resolution_parameter = 0.5     # <-- 优化2: 减少碎社区
 min_sub_clusters = 5
-max_sub_clusters = 50
+max_sub_clusters = 20
 
 # --- 路径 ---
 output_file = os.path.join(dataset_path, 'item_to_hierarchical_community.pt')
