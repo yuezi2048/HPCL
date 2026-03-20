@@ -126,3 +126,4 @@ omegaconf.log
 ./visual/output
 ./python
 /.pip
+./envs
