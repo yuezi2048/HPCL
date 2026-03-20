@@ -97,7 +97,6 @@ figures/
 *.jpg
 *.jpeg
 *.svg
-!saved/grid/Code_Generated_Image.png
 
 # Local configuration
 local_config.yaml
@@ -119,9 +118,7 @@ omegaconf.log
 
 
 ### custom ###
-*.idea/
 创新点文字/
-*saved/
 log/
 python
 pip
