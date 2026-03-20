@@ -11,9 +11,9 @@ from models.GCN import GCN
 from common.abstract_recommender import GeneralRecommender
 from utils.mi_estimator import CLUBSample
 
-class TT6PRO(GeneralRecommender):
+class TT6PROA(GeneralRecommender):
     def __init__(self, config, dataset):
-        super(TT6PRO, self).__init__(config, dataset)
+        super(TT6PROA, self).__init__(config, dataset)
 
         num_user = self.n_users
         num_item = self.n_items
@@ -203,6 +203,12 @@ class TT6PRO(GeneralRecommender):
         # DGMRec 解耦模块 (简化版) END
         # =================================================================
 
+        # 极简的门控层
+        self.fusion_gate = nn.Sequential(
+            nn.Linear(dim_x * 2, dim_x),
+            nn.Sigmoid()  # 只用一层，输出 0~1 的权重
+        ).to(self.device)
+
     def get_knn_adj_mat(self, mm_embeddings):
         context_norm = mm_embeddings.div(torch.norm(mm_embeddings, p=2, dim=-1, keepdim=True))
         sim = torch.mm(context_norm, context_norm.transpose(1, 0))
@@ -334,28 +340,28 @@ class TT6PRO(GeneralRecommender):
         return item_image_g, item_text_g, item_image_s, item_text_s
 
     def _generate_representations(self, v_rep, t_rep):
-        # 封装的辅助方法，用于从 GCN 输出生成最终嵌入
+        # 1. 极其安全的残差门控
+        concat_rep = torch.cat((v_rep, t_rep), dim=1)
+        gate = self.fusion_gate(concat_rep)
 
-        # 1. 拼接模态
-        representation = torch.cat((v_rep, t_rep), dim=1)
+        # 核心：原始特征 + 门控加权特征 (保证信息绝对不丢失，尺度不缩水)
+        v_enhanced = v_rep + gate * v_rep
+        t_enhanced = t_rep + (1.0 - gate) * t_rep
+        representation = torch.cat((v_enhanced, t_enhanced), dim=1)
 
-        # 2. 生成用户表征
-        # (注意：这里需要对传入的 v_rep, t_rep 进行 unsqueeze)
-        v_rep_u = torch.unsqueeze(v_rep[:self.num_user], 2)
-        t_rep_u = torch.unsqueeze(t_rep[:self.num_user], 2)
+        # 2. 生成用户表征 (保持你的原逻辑不变，只替换输入)
+        v_rep_u = torch.unsqueeze(v_enhanced[:self.num_user], 2)
+        t_rep_u = torch.unsqueeze(t_enhanced[:self.num_user], 2)
         user_rep = torch.cat((v_rep_u, t_rep_u), dim=2)
         user_rep = self.weight_u.transpose(1, 2) * user_rep
         user_rep = torch.cat((user_rep[:, :, 0], user_rep[:, :, 1]), dim=1)
 
-        # 3. 生成并细化物品表征
+        # 3. 物品表征
         item_rep = representation[self.num_user:]
         h = self.buildItemGraph(item_rep)
         item_rep = item_rep + h
 
-        # 4. 组合成最终嵌入
         result_embed = torch.cat((user_rep, item_rep), dim=0)
-
-        # 5. 返回所有需要的结果 (result_embed 用于 BPR, user/item_rep 用于 mask_f_loss)
         return result_embed, user_rep, item_rep
 
     def forward(self, interaction):
@@ -389,7 +395,7 @@ class TT6PRO(GeneralRecommender):
         """
         为批次中的每个物品动态识别分级样本。
         - 强正样本 (R): 通用特征在两个模态上都相似。
-        - 弱正样本 (T_v, T_t): 特定特征在一个模态上相似，在另一个模态上不相似。
+        - 弱正样本 (T_v, T_t): 特定特征在一个模态上相似，但在另一个模态的通用空间上有差异。
         """
         # 1. 提取当前批次的物品特征并进行归一化
         batch_size = len(batch_items)
@@ -415,43 +421,45 @@ class TT6PRO(GeneralRecommender):
         _, R_indices = torch.topk(score_multi, k=min(k, batch_size - 1), dim=1)
 
         # 4. 识别弱正样本 (Single-modal Similar, T_v, T_t)
-        # 创建一个掩码，排除已经被选为强正样本的物品
         R_mask = torch.zeros_like(score_multi, dtype=torch.bool).scatter_(1, R_indices, True)
-        R_mask.logical_or_(self_mask)  # 同时也排除自己
+        R_mask.logical_or_(self_mask)
+
+        # 🚀 修复1: 在这里明确计算 valid_g_mask (加入通用空间门槛过滤，确保核心类别一致)
+        # 如果相似度阈值 0.5 过于严格，你可以将其下调至 0.3
+        valid_g_mask = (sim_g_v > 0.5) & (sim_g_t > 0.5)
 
         # 视觉弱正样本 T_v
-        score_single_v = sim_s_v * (1 - sim_s_t)
-        score_single_v.masked_fill_(R_mask, -torch.inf)
+        # 逻辑: 视觉特定属性相似，但用文本通用空间(G)的差异来惩罚
+        score_single_v = sim_s_v * (1.0 - torch.tanh(1.5 * sim_g_t))
+        score_single_v.masked_fill_(R_mask | ~valid_g_mask, -torch.inf)
         _, T_v_indices = torch.topk(score_single_v, k=min(k, batch_size - 1 - k), dim=1)
 
         # 文本弱正样本 T_t
-        score_single_t = sim_s_t * (1 - sim_s_v)
-        score_single_t.masked_fill_(R_mask, -torch.inf)
+        score_single_t = sim_s_t * (1.0 - torch.tanh(1.5 * sim_g_v))
+        score_single_t.masked_fill_(R_mask | ~valid_g_mask, -torch.inf)
         _, T_t_indices = torch.topk(score_single_t, k=min(k, batch_size - 1 - k), dim=1)
 
-        # 5. 返回结果
-        # 返回的是在当前 batch 内的相对索引
         return {
             'R': R_indices,
             'T_v': T_v_indices,
             'T_t': T_t_indices
         }
 
-    def _calculate_prototype_contrastive_loss(self, student_feats, graded_samples,
+    def _calculate_prototype_contrastive_loss(self, student_feats_current, student_feats_other, graded_samples,
                                               batch_community_ids, modality_type: str, temp=0.2):
-        """TT6 干净版 + TT4PRO 轻量难度加权"""
-        student_feats = F.normalize(student_feats, dim=1)
+        """TT6 干净版 + 同构联合概率空间 + 跨模态难度加权"""
+        # 🚀 修复2: 区分当前模态 (current) 和另一模态 (other) 的特征输入
+        student_feats_current = F.normalize(student_feats_current, dim=1)
 
-        # 全局原型（已 pre-compute）
+        # 全局原型
         protos = self.global_prototypes_v if modality_type == 'visual' else self.global_prototypes_t
 
-        sim_instance = student_feats @ student_feats.T / temp
-        sim_proto = student_feats @ protos.T / temp
+        sim_instance = student_feats_current @ student_feats_current.T / temp
+        sim_proto = student_feats_current @ protos.T / temp
 
-        # 难度加权（轻量版，只用跨模态相似度差）
+        # 难度加权（使用 current 和 other 计算真正的跨模态一致性偏差）
         with torch.no_grad():
-            cross_modal_sim = (F.normalize(student_feats, dim=1) *
-                               F.normalize(student_feats, dim=1)).sum(dim=1)  # 简化
+            cross_modal_sim = (student_feats_current * F.normalize(student_feats_other, dim=1)).sum(dim=1)
             difficulty = 1.0 - cross_modal_sim
             weights = torch.sigmoid(0.5 * difficulty) + 0.5   # 安全区间 [0.5, 1.5]
 
@@ -463,6 +471,7 @@ class TT6PRO(GeneralRecommender):
         pos_proto = torch.gather(torch.exp(sim_proto), 1,
                                  batch_community_ids.unsqueeze(1)).squeeze(1)
 
+        # 同构联合概率空间损失 (分母共享)
         loss = -torch.log((pos_sim + pos_proto) /
                           (torch.exp(sim_instance).sum(1) + torch.exp(sim_proto).sum(1) + 1e-8))
         return (loss * weights).mean()
@@ -511,12 +520,26 @@ class TT6PRO(GeneralRecommender):
 
             # e. S特征分级原型对比损失
             batch_community_ids = self.item_community_map[all_batch_items]
-            loss_S_visual = self._calculate_prototype_contrastive_loss(student_s_img, graded_samples,
-                                                                       batch_community_ids,
-                                                                       modality_type='visual', temp=self.infoNCETemp)
-            loss_S_textual = self._calculate_prototype_contrastive_loss(student_s_txt, graded_samples,
-                                                                        batch_community_ids,
-                                                                        modality_type='textual', temp=self.infoNCETemp)
+
+            # 🚀 修复2调用处: 交叉传入视觉和文本的 S 特征
+            loss_S_visual = self._calculate_prototype_contrastive_loss(
+                student_feats_current=student_s_img,  # 当前模态：视觉
+                student_feats_other=student_s_txt,  # 另一模态：文本 (用于算跨模态难度)
+                graded_samples=graded_samples,
+                batch_community_ids=batch_community_ids,
+                modality_type='visual',
+                temp=self.infoNCETemp
+            )
+
+            loss_S_textual = self._calculate_prototype_contrastive_loss(
+                student_feats_current=student_s_txt,  # 当前模态：文本
+                student_feats_other=student_s_img,  # 另一模态：视觉
+                graded_samples=graded_samples,
+                batch_community_ids=batch_community_ids,
+                modality_type='textual',
+                temp=self.infoNCETemp
+            )
+
             loss_S_contrastive = loss_S_visual + loss_S_textual
 
             # f. 组合成加权的 graded loss

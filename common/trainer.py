@@ -105,10 +105,19 @@ class Trainer(AbstractTrainer):
         self.optimizer = self._build_optimizer()
 
         #fac = lambda epoch: 0.96 ** (epoch / 50)
-        lr_scheduler = config['learning_rate_scheduler']        # check zero?
-        fac = lambda epoch: lr_scheduler[0] ** (epoch / lr_scheduler[1])
-        scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=fac)
-        self.lr_scheduler = scheduler
+        # lr_scheduler = config['learning_rate_scheduler']        # check zero?
+        # fac = lambda epoch: lr_scheduler[0] ** (epoch / lr_scheduler[1])
+        # scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=fac)
+        # self.lr_scheduler = scheduler
+
+        # --- 稳健提升二：引入余弦退火学习率 ---
+        # T_max 设置为总 epoch 数，eta_min 为学习率衰减的下限
+        self.lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=self.epochs,
+            eta_min=1e-6
+        )
+        # --------------------------------------
 
         self.eval_type = config['eval_type']
         self.evaluator = TopKEvaluator(config)
