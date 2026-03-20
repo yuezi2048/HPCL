@@ -117,12 +117,12 @@ personal.yaml
 # omegaconf
 omegaconf.log
 
+
+### custom ###
 ./.idea
-
 ./创新点文字
-
 ./saved
-
 ./log
-
 ./visual/output
+./python
+/.pip
