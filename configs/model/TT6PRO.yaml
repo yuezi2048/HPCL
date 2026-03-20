@@ -8,8 +8,10 @@ mm_image_weight: 0.1
 learning_rate: [0.0001]
 reg_weight: [0.0001]
 
-infoNCETemp: [0.2]
+infoNCETemp: [0.4]
 lambda_graded_align: [0.2]
-alpha_g_s: [0.7]
+alpha_g_s: [0.9]
 
-hyper_parameters: ["reg_weight", "learning_rate", 'infoNCETemp', "lambda_graded_align",  "alpha_g_s"]
+lambda_1: [1.0]
+
+hyper_parameters: ["reg_weight", "learning_rate", 'infoNCETemp', "lambda_graded_align",  "alpha_g_s", "lambda_1"]

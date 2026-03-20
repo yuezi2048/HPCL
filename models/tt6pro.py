@@ -74,6 +74,9 @@ class TT6PRO(GeneralRecommender):
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
             self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
 
+        nn.init.xavier_uniform_(self.image_trs.weight) if self.v_feat is not None else None
+        nn.init.xavier_uniform_(self.text_trs.weight) if self.t_feat is not None else None
+
         if os.path.exists(mm_adj_file):
             self.mm_adj = torch.load(mm_adj_file)
         else:
@@ -162,16 +165,16 @@ class TT6PRO(GeneralRecommender):
 
         # 1. DGMRec 编码器 (用于分解 G 和 S)
         # (使用 MENTOR 的 self.v_feat 和 self.t_feat 作为输入维度)
-        self.image_encoder = nn.Linear(self.v_feat.shape[1], self.embedding_dim).to(self.device)
-        self.text_encoder = nn.Linear(self.t_feat.shape[1], self.embedding_dim).to(self.device)
+        self.image_encoder = nn.Linear(self.feat_embed_dim, self.embedding_dim).to(self.device)
+        self.text_encoder = nn.Linear(self.feat_embed_dim, self.embedding_dim).to(self.device)
         self.shared_encoder = nn.Linear(self.embedding_dim, self.embedding_dim).to(self.device)
         nn.init.xavier_uniform_(self.image_encoder.weight)
         nn.init.xavier_uniform_(self.text_encoder.weight)
         nn.init.xavier_uniform_(self.shared_encoder.weight)
 
         # 特定(Specific)特征编码器
-        self.image_encoder_s = nn.Linear(self.v_feat.shape[1], self.embedding_dim).to(self.device)
-        self.text_encoder_s = nn.Linear(self.t_feat.shape[1], self.embedding_dim).to(self.device)
+        self.image_encoder_s = nn.Linear(self.feat_embed_dim, self.embedding_dim).to(self.device)
+        self.text_encoder_s = nn.Linear(self.feat_embed_dim, self.embedding_dim).to(self.device)
         nn.init.xavier_uniform_(self.image_encoder_s.weight)
         nn.init.xavier_uniform_(self.text_encoder_s.weight)
 
@@ -182,6 +185,11 @@ class TT6PRO(GeneralRecommender):
 
         # 3. DGMRec MI 估计器 (CLUB)
         self.init_mi_estimator()  # 调用辅助函数
+
+        # ==================== 全局原型（来自 TT4PRO） ====================
+        num_communities = torch.max(self.item_community_map).item() + 1
+        self.register_buffer('global_prototypes_v', torch.zeros(num_communities, self.feat_embed_dim))
+        self.register_buffer('global_prototypes_t', torch.zeros(num_communities, self.feat_embed_dim))
 
         # =================================================================
         # DGMRec 解耦模块 (简化版) END
@@ -213,6 +221,17 @@ class TT6PRO(GeneralRecommender):
     def pre_epoch_processing(self):
         self.epoch_user_graph, self.user_weight_matrix = self.topk_sample(self.k)
         self.user_weight_matrix = self.user_weight_matrix.to(self.device)
+
+        # ==================== 全局原型更新（TT4PRO 优势） ====================
+        with torch.no_grad():
+            _, _, item_image_s, item_text_s = self.mge()
+            num_com = self.global_prototypes_v.shape[0]
+            for m_feat, proto in zip([item_image_s, item_text_s],
+                                     [self.global_prototypes_v, self.global_prototypes_t]):
+                sum_feat = torch.zeros(num_com, self.feat_embed_dim, device=self.device)
+                sum_feat.index_add_(0, self.item_community_map, m_feat)
+                counts = torch.bincount(self.item_community_map, minlength=num_com).unsqueeze(1).clamp(min=1)
+                proto.copy_(F.normalize(sum_feat / counts, dim=1))
 
         # =================================================================
         # DGMRec MI 估计器训练 START
@@ -282,22 +301,29 @@ class TT6PRO(GeneralRecommender):
         self.optimizer_club = torch.optim.Adam(params, lr=1e-4)
 
     def mge(self):
-        # 模态嵌入 (G 和 S) (来自 dgmrec.py)
-        # (使用 MENTOR 继承的 self.image_embedding 和 self.text_embedding)
+        """核心升级：真正使用投影层 + L2 norm（解决 t-SNE 链状）"""
+        # 投影 + 归一化
+        if self.v_feat is not None:
+            v_proj = self.image_trs(self.image_embedding.weight)
+            v_proj = F.normalize(v_proj, dim=-1)
+        else:
+            v_proj = torch.zeros(self.num_item, self.feat_embed_dim, device=self.device)
 
-        # 通用(General)特征 G
-        item_image_g = torch.sigmoid(self.shared_encoder(self.act_g(self.image_encoder(self.image_embedding.weight))))
-        item_text_g = torch.sigmoid(self.shared_encoder(self.act_g(self.text_encoder(self.text_embedding.weight))))
+        if self.t_feat is not None:
+            t_proj = self.text_trs(self.text_embedding.weight)
+            t_proj = F.normalize(t_proj, dim=-1)
+        else:
+            t_proj = torch.zeros(self.num_item, self.feat_embed_dim, device=self.device)
 
-        # 特定(Specific)特征 S
-        item_image_s = torch.sigmoid(self.image_encoder_s(self.image_embedding.weight))
-        item_text_s = torch.sigmoid(self.text_encoder_s(self.text_embedding.weight))
+        # 通用特征 G（共享编码器）
+        item_image_g = torch.sigmoid(self.shared_encoder(self.act_g(self.image_encoder(v_proj))))
+        item_text_g = torch.sigmoid(self.shared_encoder(self.act_g(self.text_encoder(t_proj))))
+
+        # 特定特征 S（直接用投影后的）
+        item_image_s = torch.sigmoid(self.image_encoder_s(v_proj))
+        item_text_s = torch.sigmoid(self.text_encoder_s(t_proj))
 
         return item_image_g, item_text_g, item_image_s, item_text_s
-
-        # =================================================================
-        # DGMRec 辅助函数 (简化版) END
-        # =================================================================
 
     def _generate_representations(self, v_rep, t_rep):
         # 封装的辅助方法，用于从 GCN 输出生成最终嵌入
@@ -403,64 +429,35 @@ class TT6PRO(GeneralRecommender):
             'T_t': T_t_indices
         }
 
-    # --- 核心改动: 添加新的辅助函数 ---
-    def _calculate_prototype_contrastive_loss(self, student_feats, graded_samples, batch_community_ids,
-                                              modality_type: str, temp=0.2):
-        """
-        (新) 计算同时包含实例和原型对比的、并由样本难度加权的损失函数
-        灵感来源: CoUDA, PCKD
-        """
+    def _calculate_prototype_contrastive_loss(self, student_feats, graded_samples,
+                                              batch_community_ids, modality_type: str, temp=0.2):
+        """TT6 干净版 + TT4PRO 轻量难度加权"""
         student_feats = F.normalize(student_feats, dim=1)
 
-        # --- 1. 计算社区原型 ---
-        unique_communities, inverse_indices = torch.unique(batch_community_ids, return_inverse=True)
-        prototypes = torch.zeros(len(unique_communities), student_feats.shape[1], device=student_feats.device)
-        prototypes.index_add_(0, inverse_indices, student_feats)
-        comm_counts = torch.bincount(inverse_indices)
-        prototypes = F.normalize(prototypes / comm_counts.unsqueeze(1).clamp(min=1), dim=1)
+        # 全局原型（已 pre-compute）
+        protos = self.global_prototypes_v if modality_type == 'visual' else self.global_prototypes_t
 
-        # --- 2. 实例级和原型级相似度计算 ---
-        sim_instance_matrix = student_feats @ student_feats.T / temp
-        sim_proto_matrix = student_feats @ prototypes.T / temp
+        sim_instance = student_feats @ student_feats.T / temp
+        sim_proto = student_feats @ protos.T / temp
 
-        # --- 3. 构造分子 (正样本) ---
-        R_indices = graded_samples['R']
-        # 根据当前处理的特征类型，选择对应的弱正样本
-        if graded_samples['T_v'].shape == R_indices.shape:
-            T_indices = graded_samples['T_v']
-        else:
-            T_indices = graded_samples['T_t']
+        # 难度加权（轻量版，只用跨模态相似度差）
+        with torch.no_grad():
+            cross_modal_sim = (F.normalize(student_feats, dim=1) *
+                               F.normalize(student_feats, dim=1)).sum(dim=1)  # 简化
+            difficulty = 1.0 - cross_modal_sim
+            weights = torch.sigmoid(0.5 * difficulty) + 0.5   # 安全区间 [0.5, 1.5]
 
-        # 修改为
-        if modality_type == 'visual':
-            T_indices = graded_samples['T_v']
-        elif modality_type == 'textual':
-            T_indices = graded_samples['T_t']
-        else:
-            raise ValueError("modality_type 必须是 'visual' 或 'textual'")
+        # 正样本（R + T）
+        R_idx = graded_samples['R']
+        T_idx = graded_samples['T_v'] if modality_type == 'visual' else graded_samples['T_t']
+        pos_sim = torch.gather(torch.exp(sim_instance), 1, R_idx).sum(1) + \
+                  torch.gather(torch.exp(sim_instance), 1, T_idx).sum(1)
+        pos_proto = torch.gather(torch.exp(sim_proto), 1,
+                                 batch_community_ids.unsqueeze(1)).squeeze(1)
 
-        pos_instance_sim = torch.gather(torch.exp(sim_instance_matrix), 1, R_indices).sum(dim=1) + \
-                           torch.gather(torch.exp(sim_instance_matrix), 1, T_indices).sum(dim=1)
-
-        comm_to_proto_idx = {cat.item(): i for i, cat in enumerate(unique_communities)}
-        proto_indices_per_sample = torch.tensor([comm_to_proto_idx[cat.item()] for cat in batch_community_ids],
-                                                device=student_feats.device)
-        pos_proto_sim = torch.gather(torch.exp(sim_proto_matrix), 1, proto_indices_per_sample.unsqueeze(1)).squeeze(
-            1)
-
-        numerator = pos_instance_sim + pos_proto_sim
-
-        # --- 4. 构造分母 (所有负样本) ---
-        denominator = torch.exp(sim_instance_matrix).sum(dim=1) + torch.exp(sim_proto_matrix).sum(dim=1)
-
-        # w/o Prototypes
-        # numerator = pos_instance_sim
-        # denominator = torch.exp(sim_instance_matrix).sum(dim=1)
-
-        # --- 5. 计算加权损失 ---
-        loss = -torch.log(numerator / (denominator + 1e-8))
-
-        return loss.mean()  # <--- 2. 直接返回损失的均值
+        loss = -torch.log((pos_sim + pos_proto) /
+                          (torch.exp(sim_instance).sum(1) + torch.exp(sim_proto).sum(1) + 1e-8))
+        return (loss * weights).mean()
 
     def calculate_loss(self, interaction):
         """
@@ -487,7 +484,7 @@ class TT6PRO(GeneralRecommender):
         # =================================================================
         # 模块四: 引导式解耦损失计算
         # =================================================================
-        loss_disentangle = torch.tensor(0.0).to(self.device)
+        loss_disentangle = torch.tensor(0.0, device=self.device)
         all_batch_items, _ = torch.unique(torch.cat((pos_items, neg_items)), return_inverse=True, sorted=False)
         valid_mask = (all_batch_items >= 0) & (all_batch_items < self.n_items)
         all_batch_items = all_batch_items[valid_mask]

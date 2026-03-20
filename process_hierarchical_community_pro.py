@@ -1,3 +1,5 @@
+import argparse
+
 import torch
 import igraph as ig
 import leidenalg as la
@@ -21,19 +23,25 @@ torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
+# --- 命令行参数解析 ---
+parser = argparse.ArgumentParser(description='层级社区发现脚本')
+parser.add_argument('--dataset', '-d', type=str, default='baby', help='数据集名称 (baby/clothing/sports)')
+parser.add_argument('--datapath', '-p', type=str, default='./data/', help='数据路径')
+args = parser.parse_args()
+
 # --- 配置 ---
 config = {
-    'dataset': 'baby',
-    'data_path': '/openbayes/input/input0/',
+    'dataset': args.dataset,
+    'data_path': args.datapath,
     'USER_ID_FIELD': 'userID',
     'ITEM_ID_FIELD': 'itemID',
     'inter_splitting_label': 'x_label',
-    'inter_file_name': 'baby.inter',
     'field_separator': '\t',
     'filter_out_cod_start_users': False
 }
 dataset_name = config['dataset']
 dataset_path = os.path.join(config['data_path'], dataset_name)
+config['inter_file_name'] = f'{dataset_name}.inter'
 
 # --- 超参数（已优化）---
 content_knn_k = 10
