@@ -123,4 +123,5 @@ log/
 python
 pip
 envs/
-common/__pycache/*
+# Python 缓存
+*/__pycache__/*
